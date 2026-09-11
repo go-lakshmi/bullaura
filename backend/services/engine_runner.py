@@ -14,7 +14,7 @@ def _run_original_pipeline():
     """Use the same startup sequence as the user's original main.py."""
     try:
         from backend.broker.angelone import AngelOneClient
-        from backend.data.instrument_master import InstrumentMaster
+        from data.instrument_master import InstrumentMaster
         from backend.services.nse_engine import NSEHighPerformanceTradingPipeline
 
         log.info("Starting up Stock Shocker / AI-Trader Pipeline...")
@@ -58,17 +58,49 @@ def _run_original_pipeline():
 
 
 def _snapshot_loop():
-    """Collect engine state continuously; AppState publishes it every 60 seconds."""
+    """Build and publish exactly one local-UI batch every 60 seconds.
+
+    IMPORTANT: do NOT build the 532-stock snapshot every second. That work
+    was unnecessarily expensive and could delay the 60-second UI cadence.
+    The engine keeps updating live state continuously; this thread takes one
+    point-in-time snapshot of that state once per minute.
+    """
     from backend.services.live_data import build_snapshot
+
+    interval = 60.0
+    next_publish = time.monotonic() + interval
+    batch_no = 0
 
     while True:
         try:
+            sleep_for = max(0.0, next_publish - time.monotonic())
+            if sleep_for:
+                time.sleep(sleep_for)
+
             engine = state.engine
             if engine is not None:
-                state.set_snapshot(build_snapshot(engine))
+                started = time.monotonic()
+                snapshot = build_snapshot(engine)
+                build_seconds = time.monotonic() - started
+                stocks = snapshot.get("stocks", [])
+                batch_no += 1
+
+                published = state.set_snapshot(snapshot, force=True)
+                log.info(
+                    "LOCAL UI 60s batch #%d | collected=%d | published=%s | build=%.2fs",
+                    batch_no, len(stocks), published, build_seconds
+                )
+
+            # Keep the cadence anchored to the original schedule. If snapshot
+            # construction takes longer than expected, skip missed boundaries
+            # rather than sending several batches back-to-back.
+            now = time.monotonic()
+            while next_publish <= now:
+                next_publish += interval
+
         except Exception:
             log.exception("Failed to build web dashboard snapshot.")
-        time.sleep(1)
+            next_publish = time.monotonic() + interval
 
 
 async def start_engine(state_obj=state):

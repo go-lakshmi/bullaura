@@ -388,6 +388,7 @@ class FreeNewsManager:
         return signals
 
 dashboard = MobileDashboard(session_name="Mainboard IPO Momentum Matrix")
+
 class NSEHighPerformanceTradingPipeline:
 
     def __init__(self, broker, instrument_master, config_path="data/trades_config.json", strategy_conf_path="data/conf.json", portfolio_tracker=None, mobile_dashboard=None):
@@ -441,7 +442,6 @@ class NSEHighPerformanceTradingPipeline:
         return [f"{sym}" for sym in eq_stocks.dropna().unique()]   
 
 
-
     def download_stockdata_from_nse(self, symbols):
         """
         Download NSE 1-month data and apply ONLY these filters:
@@ -460,7 +460,7 @@ class NSEHighPerformanceTradingPipeline:
         self.volume_shockers.
         """
 
-        cache_file = Path("backend/data/volume_shockers_cache.json")
+        cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
         cache_version = "nse_live_volume_shocker_v3"
 
@@ -489,26 +489,15 @@ class NSEHighPerformanceTradingPipeline:
             try:
                 time.sleep(0.3)
 
-                # df = capital_market.price_volume_data(
-                #     symbol=symbol,
-                #     period="1M"
-                # )
-                to_date_obj = datetime.now()
-                from_date_obj = to_date_obj - timedelta(days=30)
-
-                to_date = to_date_obj.strftime("%d-%m-%Y")
-                from_date = from_date_obj.strftime("%d-%m-%Y")
-                
                 df = capital_market.price_volume_data(
                     symbol=symbol,
-                    from_date=from_date,
-                    to_date=to_date
+                    period="1M"
                 )
 
                 if df is None or df.empty:
                     return symbol, None
 
-                df = df.copy()               
+                df = df.copy()
 
                 # ============================================================
                 # SORT BY DATE - NEWEST FIRST
@@ -915,15 +904,15 @@ class NSEHighPerformanceTradingPipeline:
 
             except Exception as ex:
 
-                log.error(
-                    f"NSE filtering failed for {symbol}: {ex} {traceback.format_exc()}"
+                log.warning(
+                    f"NSE filtering failed for {symbol}: {ex}"
                 )
 
                 return symbol, None
 
         results = {}
 
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=3) as executor:
             future_to_symbol = {
                 executor.submit(fetch_single_stock, sym): sym
                 for sym in symbols
@@ -973,6 +962,7 @@ class NSEHighPerformanceTradingPipeline:
 
         except Exception as e:
             print(f"Failed to save cache: {e}")
+    
 
     def load_raw_scrip_master(self):
             """
@@ -985,8 +975,8 @@ class NSEHighPerformanceTradingPipeline:
             if self.scrip_master_data is not None:
                 return
     
-            local_master_path = Path("backend/data/local_scrip_master.json")
-            temp_master_path = Path("backend/data/local_scrip_master.tmp")
+            local_master_path = Path("data/local_scrip_master.json")
+            temp_master_path = Path("data/local_scrip_master.tmp")
             today_date = date.today()
     
             if local_master_path.exists():
@@ -1476,6 +1466,20 @@ class NSEHighPerformanceTradingPipeline:
         if ltp <= 0 or previous_close <= 0:
             return None
 
+        position_52w_pct = cs.get("position_52w_pct")
+        if position_52w_pct is None:
+            return None
+        
+        try:
+            position_52w_pct = float(position_52w_pct)
+        except (TypeError, ValueError):
+            return None
+        
+        if position_52w_pct < 30.0:
+            return None
+
+        
+
         avg_volume = float(past_data.get("avg_volume_20d", 0) or 0)
         avg_trades = float(past_data.get("avg_trades_20d", 0) or 0)
         avg_turnover = float(past_data.get("avg_turnover_20d", 0) or 0)
@@ -1904,7 +1908,7 @@ class NSEHighPerformanceTradingPipeline:
         except (TypeError, ValueError):
             return None
 
-        if position_52w_pct < 50.0:
+        if position_52w_pct < 30.0:
             return None
 
         avg_volume = float(past_data.get("avg_volume_20d", 0) or 0)

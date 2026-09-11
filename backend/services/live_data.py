@@ -10,6 +10,32 @@ def _num(value, default=0.0):
         return float(default)
 
 
+def _category(signal, fallback="WAIT"):
+    """Normalize Swing/BTST recommendations to the common UI categories."""
+    if not signal:
+        return fallback
+    recommendation = str(signal.get("recommendation", "") or "").strip().upper()
+
+    if recommendation == "BUY" or recommendation == "BTST CANDIDATE":
+        return "BUY"
+    if recommendation == "WAIT" or recommendation == "BTST EARLY":
+        return "WAIT"
+    if recommendation in {"BREAK", "BREAKOUT"}:
+        return "BREAK"
+    if recommendation in {"WATCH", "BTST WATCH"}:
+        # Swing's WATCH can represent an already reached breakout.
+        # Preserve that distinction as BREAK; otherwise it remains WATCH.
+        if bool(signal.get("breakout_persistent")):
+            return "BREAK"
+        if _num(signal.get("distance"), 999.0) <= 0:
+            return "BREAK"
+        return "WATCH"
+
+    # If the engine ever supplies an unfamiliar BTST label, let the Swing
+    # category for the same symbol provide the stable four-state category.
+    return fallback
+
+
 def build_snapshot(engine):
     """
     Build the local-UI snapshot.
@@ -152,6 +178,13 @@ def build_snapshot(engine):
             "swing_signal": swing_display.get("recommendation", ""),
             "btst_score": _num(btst_display.get("score")),
             "swing_score": _num(swing_display.get("score")),
+            "btst_category": _category(
+                btst_display, _category(swing_display, "")
+            ),
+            "swing_category": _category(swing_display, ""),
+            "category": (
+                _category(btst_display, _category(swing_display, "WAIT"))
+            ),
             "signal_channel": active_channel,
             "recommendation": recommendation,
             "status": status,
@@ -196,9 +229,42 @@ def build_snapshot(engine):
         if existing is None or stock_payload["rating"] > existing["rating"]:
             stocks_by_symbol[symbol] = stock_payload
 
+    # Keep independent top-30 lists for the two engines. The UI can stay
+    # neutral, while downstream consumers still have the full Swing and BTST
+    # ranking context.
+    swing_candidates = []
+    btst_candidates = []
+    for item in stocks_by_symbol.values():
+        if item.get("swing_category"):
+            swing_candidates.append({
+                "symbol": item["symbol"],
+                "score": item.get("swing_score", 0),
+                "category": item["swing_category"],
+                "ltp": item.get("ltp", 0),
+                "gain": item.get("gain", 0),
+                "buy": item.get("buying_pressure", 0) * 100,
+            })
+        if item.get("btst_category"):
+            btst_candidates.append({
+                "symbol": item["symbol"],
+                "score": item.get("btst_score", 0),
+                "category": item["btst_category"],
+                "ltp": item.get("ltp", 0),
+                "gain": item.get("gain", 0),
+                "buy": item.get("buying_pressure", 0) * 100,
+            })
+
+    swing_top30 = sorted(swing_candidates, key=lambda x: x["score"], reverse=True)[:30]
+    btst_top30 = sorted(btst_candidates, key=lambda x: x["score"], reverse=True)[:30]
+
     stocks = sorted(
         stocks_by_symbol.values(),
         key=lambda x: x.get("rating", 0),
         reverse=True,
     )[:30]
-    return {"updated_at": time.time(), "stocks": stocks}
+    return {
+        "updated_at": time.time(),
+        "stocks": stocks,
+        "swing_top30": swing_top30,
+        "btst_top30": btst_top30,
+    }
