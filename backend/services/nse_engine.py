@@ -536,12 +536,12 @@ class NSEHighPerformanceTradingPipeline:
 
                     df = df[df["Series"] == "EQ"].copy()
 
-                # Need at least 22 sessions
-                if len(df) < 22:
+                # Need at least 21 sessions
+                if len(df) < 21:
                     return symbol, None
 
-                # Keep latest 22 sessions
-                df = df.head(22).copy()
+                # Keep latest 21 sessions
+                df = df.head(21).copy()
 
                 # ============================================================
                 # REQUIRED COLUMNS
@@ -597,7 +597,7 @@ class NSEHighPerformanceTradingPipeline:
                     ]
                 ).copy()
 
-                if len(df) < 22:
+                if len(df) < 21:
                     return symbol, None
 
                 # ============================================================
@@ -639,7 +639,7 @@ class NSEHighPerformanceTradingPipeline:
 
                 # Available oldest four sessions:
                 # D18, D19, D20, D21
-                older_4 = close[18:22]
+                older_4 = close[17:22]
 
                 # Recent ranges
                 recent_11 = close[0:11]   # D0-D10
@@ -747,7 +747,7 @@ class NSEHighPerformanceTradingPipeline:
                 # ============================================================
                 # HISTORICAL BREAKOUT BASELINE
                 #
-                # These metrics are calculated from the 22 NSE sessions and
+                # These metrics are calculated from the 21 NSE sessions and
                 # stored with the stock.  They are used later by the live
                 # Angel One confirmation stage.
                 # ============================================================
@@ -820,7 +820,7 @@ class NSEHighPerformanceTradingPipeline:
                 # ============================================================
                 # CONVERT DATAFRAME TO RECORDS
                 #
-                # ALL 22 NSE RECORDS ARE RETAINED.
+                # ALL 21 NSE RECORDS ARE RETAINED.
                 # ============================================================
 
                 records = df.to_dict(
@@ -898,7 +898,7 @@ class NSEHighPerformanceTradingPipeline:
                         else "D0-D15"
                     ),
 
-                    # ALL 22 NSE records.
+                    # ALL 21 NSE records.
                     "nse_data": records,
                 }
 
@@ -1168,87 +1168,105 @@ class NSEHighPerformanceTradingPipeline:
 
         while True:
             try:
+                # Process the first available tick, then immediately drain all
+                # ticks already waiting in the queue.  This keeps every subscribed
+                # stock moving through the existing Angel One -> analysis pipeline
+                # without introducing an artificial 1-minute processing wait.
                 msg = self.tick_queue.get(timeout=1)
 
-                token = str(msg.get("token"))
-                cache = self.live_cache.get(token)
+                pending_messages = [msg]
+                while True:
+                    try:
+                        pending_messages.append(self.tick_queue.get_nowait())
+                    except queue.Empty:
+                        break
 
-                if cache:
+                for msg in pending_messages:
+                    token = str(msg.get("token"))
+                    cache = self.live_cache.get(token)
+
+                    if not cache:
+                        continue
+
                     symbol = cache.get("symbol", "")
                     cs = self.analyze_tick_metrics(token, msg)
 
-                    if cs.get("ltp", 0) > 0:
-                        past_data = self.volume_shockers.get(symbol)
+                    if cs.get("ltp", 0) <= 0:
+                        continue
 
-                        if past_data:
-                            signal = self.evaluate_live_breakout(
-                                symbol,
-                                past_data,
-                                cs
-                            )
+                    past_data = self.volume_shockers.get(symbol)
+                    if not past_data:
+                        continue
 
-                            btst_signal = self.evaluate_btst_candidate(
-                                symbol,
-                                past_data,
-                                cs
-                            )
+                    signal = self.evaluate_live_breakout(
+                        symbol,
+                        past_data,
+                        cs
+                    )
 
-                            # Mirror the already-computed live state to the web UI.
-                            # No qualification condition is changed here.
-                            self._update_ui_state(
-                                symbol, token, cs, signal, btst_signal, past_data
-                            )
+                    btst_signal = self.evaluate_btst_candidate(
+                        symbol,
+                        past_data,
+                        cs
+                    )
 
-                            if btst_signal:
-                                existing_btst = next(
-                                    (
-                                        item for item in accumulated_btst_signals
-                                        if item["symbol"] == symbol
-                                    ),
-                                    None
-                                )
-                                # Mobile/Telegram BTST display filter:
-                                # keep only stocks with buy pressure > 40% and
-                                # current gain < 3%.  Do this before the top-30
-                                # collection so non-matching stocks are skipped.
-                                btst_buy_pressure = float(btst_signal.get("buy", 0) or 0)
-                                btst_gain = float(btst_signal.get("gain", 0) or 0)
+                    # Mirror the already-computed live state to the web UI on
+                    # every processed Angel One tick.  No qualification condition
+                    # is changed here.
+                    self._update_ui_state(
+                        symbol, token, cs, signal, btst_signal, past_data
+                    )
 
-                                if btst_buy_pressure > 40.0 and btst_gain < 3.0:
-                                    if (
-                                        existing_btst is None
-                                        or btst_signal["score"] > existing_btst["score"]
-                                    ):
-                                        if existing_btst is not None:
-                                            accumulated_btst_signals.remove(existing_btst)
-                                        accumulated_btst_signals.append(btst_signal)
+                    if btst_signal:
+                        existing_btst = next(
+                            (
+                                item for item in accumulated_btst_signals
+                                if item["symbol"] == symbol
+                            ),
+                            None
+                        )
+                        # Mobile/Telegram BTST display filter:
+                        # keep only stocks with buy pressure > 40% and
+                        # current gain < 3%.  Do this before the top-30
+                        # collection so non-matching stocks are skipped.
+                        btst_buy_pressure = float(btst_signal.get("buy", 0) or 0)
+                        btst_gain = float(btst_signal.get("gain", 0) or 0)
 
-                            if signal:
-                                # Keep the strongest/current signal for the
-                                # symbol during this 60-second batch.
-                                existing = next(
-                                    (
-                                        item for item in accumulated_signals
-                                        if item["symbol"] == symbol
-                                    ),
-                                    None
-                                )
+                        if btst_buy_pressure > 30.0 and btst_gain < 5.0:
+                            if (
+                                existing_btst is None
+                                or btst_signal["score"] > existing_btst["score"]
+                            ):
+                                if existing_btst is not None:
+                                    accumulated_btst_signals.remove(existing_btst)
+                                accumulated_btst_signals.append(btst_signal)
 
-                                # Mobile/Telegram LIVE display filter:
-                                # keep only stocks with buy pressure > 40% and
-                                # current gain < 3%. Apply before top-30 collection.
-                                live_buy_pressure = float(signal.get("buy", 0) or 0)
-                                live_gain = float(signal.get("gain", 0) or 0)
+                    if signal:
+                        # Keep the strongest/current signal for the
+                        # symbol during this 60-second batch.
+                        existing = next(
+                            (
+                                item for item in accumulated_signals
+                                if item["symbol"] == symbol
+                            ),
+                            None
+                        )
 
-                                if live_buy_pressure > 40.0 and live_gain < 3.0:
-                                    if (
-                                        existing is None
-                                        or signal["score"] > existing["score"]
-                                    ):
-                                        if existing is not None:
-                                            accumulated_signals.remove(existing)
+                        # Mobile/Telegram LIVE display filter:
+                        # keep only stocks with buy pressure > 40% and
+                        # current gain < 3%. Apply before top-30 collection.
+                        live_buy_pressure = float(signal.get("buy", 0) or 0)
+                        live_gain = float(signal.get("gain", 0) or 0)
 
-                                        accumulated_signals.append(signal)
+                        if live_buy_pressure > 30.0 and live_gain < 5.0:
+                            if (
+                                existing is None
+                                or signal["score"] > existing["score"]
+                            ):
+                                if existing is not None:
+                                    accumulated_signals.remove(existing)
+
+                                accumulated_signals.append(signal)
 
                 # ========================================================
                 # DISPATCH EVERY 60 SECONDS

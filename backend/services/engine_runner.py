@@ -58,16 +58,15 @@ def _run_original_pipeline():
 
 
 def _snapshot_loop():
-    """Build and publish exactly one local-UI batch every 60 seconds.
+    """Build and publish the latest local-UI snapshot continuously (about once per second).
 
-    IMPORTANT: do NOT build the 532-stock snapshot every second. That work
-    was unnecessarily expensive and could delay the 60-second UI cadence.
-    The engine keeps updating live state continuously; this thread takes one
-    point-in-time snapshot of that state once per minute.
+    The Angel One engine keeps updating live state continuously. This thread
+    publishes a point-in-time snapshot frequently so the web dashboard sees
+    all currently processed stocks without waiting for a 60-second batch.
     """
     from backend.services.live_data import build_snapshot
 
-    interval = 60.0
+    interval = 1.0
     next_publish = time.monotonic() + interval
     batch_no = 0
 
@@ -87,7 +86,7 @@ def _snapshot_loop():
 
                 published = state.set_snapshot(snapshot, force=True)
                 log.info(
-                    "LOCAL UI 60s batch #%d | collected=%d | published=%s | build=%.2fs",
+                    "LOCAL UI 1s snapshot #%d | collected=%d | published=%s | build=%.2fs",
                     batch_no, len(stocks), published, build_seconds
                 )
 
