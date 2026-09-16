@@ -66,7 +66,7 @@ def _snapshot_loop():
     """
     from backend.services.live_data import build_snapshot
 
-    interval = 1.0
+    interval = 5.0
     next_publish = time.monotonic() + interval
     batch_no = 0
 
@@ -85,7 +85,7 @@ def _snapshot_loop():
                 batch_no += 1
 
                 published = state.set_snapshot(snapshot, force=True)
-                log.info(
+                log.debug(
                     "LOCAL UI 1s snapshot #%d | collected=%d | published=%s | build=%.2fs",
                     batch_no, len(stocks), published, build_seconds
                 )

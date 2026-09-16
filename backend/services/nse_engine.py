@@ -474,14 +474,14 @@ class NSEHighPerformanceTradingPipeline:
                     and cached_data.get("version") == cache_version
                 ):
                     self.volume_shockers = cached_data.get("data", {})
-                    print(
+                    log.info(
                         f"Loaded {len(self.volume_shockers)} filtered stocks from cache."
                     )
                     return
             except Exception as e:
-                print(f"Cache read error: {e}. Re-downloading...")
+                log.info(f"Cache read error: {e}. Re-downloading...")
 
-        print(
+        log.info(
             f"Downloading 1-month historical data for {len(symbols)} NSE stocks..."
         )
 
@@ -931,7 +931,7 @@ class NSEHighPerformanceTradingPipeline:
                 completed += 1
 
                 if completed % 50 == 0:
-                    print(
+                    log.info(
                         f"Progress: {completed}/{len(symbols)} stocks processed..."
                     )
 
@@ -939,7 +939,7 @@ class NSEHighPerformanceTradingPipeline:
 
         self.volume_shockers = results
 
-        print(
+        log.info(
             f"\nNSE filters passed: {len(results)} / {len(symbols)} stocks."
         )
 
@@ -958,10 +958,10 @@ class NSEHighPerformanceTradingPipeline:
                     default=str,
                 )
 
-            print("NSE filtered data cached successfully.")
+            log.info("NSE filtered data cached successfully.")
 
         except Exception as e:
-            print(f"Failed to save cache: {e}")
+            log.info(f"Failed to save cache: {e}")
     
 
     def load_raw_scrip_master(self):
@@ -1243,7 +1243,7 @@ class NSEHighPerformanceTradingPipeline:
 
                     if signal:
                         # Keep the strongest/current signal for the
-                        # symbol during this 60-second batch.
+                        # symbol during this 20-second batch.
                         existing = next(
                             (
                                 item for item in accumulated_signals
@@ -1269,12 +1269,12 @@ class NSEHighPerformanceTradingPipeline:
                                 accumulated_signals.append(signal)
 
                 # ========================================================
-                # DISPATCH EVERY 60 SECONDS
+                # DISPATCH EVERY 20 SECONDS
                 # ========================================================
 
                 current_time = time.time()
 
-                if current_time - last_dispatch_time >= 60.0:
+                if current_time - last_dispatch_time >= 20.0:
 
                     if accumulated_signals:
                         # News is deliberately outside the technical scoring engine.
@@ -1338,10 +1338,10 @@ class NSEHighPerformanceTradingPipeline:
             except queue.Empty:
                 # No tick arrived within one second. Still maintain the
                 # 60-second dispatch clock.
-                log.info(f"no ticker recieved ")
+                log.debug("No ticker received within the 1-second queue wait.")
                 current_time = time.time()
 
-                if current_time - last_dispatch_time >= 60.0:
+                if current_time - last_dispatch_time >= 20.0:
                     if accumulated_signals:
                         news_symbols = [s.get("symbol") for s in accumulated_signals[:30]]
                         self.news_manager.refresh_async(news_symbols)

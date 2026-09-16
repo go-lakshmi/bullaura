@@ -19,7 +19,7 @@ async def websocket_endpoint(websocket: WebSocket):
             if snapshot_updated_at is not None and snapshot_updated_at != last_sent_at:
                 await websocket.send_json(snapshot)
                 last_sent_at = snapshot_updated_at
-                log.info(
+                log.debug(
                     "LOCAL UI WebSocket sent batch updated_at=%s stocks=%d client=%s",
                     snapshot_updated_at, len(snapshot.get("stocks", [])), client
                 )

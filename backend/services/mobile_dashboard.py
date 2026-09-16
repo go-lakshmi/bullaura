@@ -359,13 +359,13 @@ class MobileDashboard:
                 )
 
                 if response.status_code != 200:
-                    print(
+                    log.info(
                         "Telegram API alert transmission failed: "
                         f"{response.status_code} {response.text}"
                     )
 
             except Exception as e:
-                print(
+                log.info(
                     "Failed to transmit mobile dashboard data "
                     f"over Telegram: {e}"
                 )
@@ -395,7 +395,7 @@ class MobileDashboard:
             )
 
             if not final_top_10:
-                print(
+                log.info(
                     "SYSTEM STATUS: Scanning stream... "
                     "No assets currently pass all gates."
                 )
@@ -406,7 +406,7 @@ class MobileDashboard:
                     reverse=True,
                 )
 
-                print(
+                log.info(
                     "\n"
                     + "=" * 78
                     + f"\n {self.session_name.upper()}"
@@ -429,7 +429,7 @@ class MobileDashboard:
                         round(self._num(stock.get("score")))
                     )
 
-                    print(
+                    log.info(
                         f"{self._recommendation_icon(recommendation)} "
                         f"{symbol:<12} "
                         f"{recommendation:<6} "
@@ -439,7 +439,7 @@ class MobileDashboard:
                         f"BUY={self._num(stock.get('buy')):.0f}%"
                     )
 
-                print("=" * 78)
+                log.info("=" * 78)
 
             self._push_to_telegram(
                 final_top_10,
@@ -448,6 +448,6 @@ class MobileDashboard:
             )
 
         except Exception as e:
-            print(
+            log.info(
                 f"Mobile Render System encountered an exception: {e}"
             )
