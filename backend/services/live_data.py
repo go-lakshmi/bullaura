@@ -133,6 +133,56 @@ def build_snapshot(engine):
         price_history = historical_price[-31:]
         volume_history = historical_volume[-31:]
 
+        # ---------------------------------------------------------------
+        # TODAY'S INTRADAY DATA FOR THE STATUS-HOVER POPUP
+        # ---------------------------------------------------------------
+        # nse_engine records one Angel One observation per minute in
+        # cache["intraday_samples"]. Convert that cache into exactly the
+        # fields expected by frontend/components/TodayPopup.jsx.
+        #
+        # Angel One volume is cumulative for the session, so the popup
+        # volume bars use the delta from the previous minute.
+        raw_intraday = list(cache.get("intraday_samples") or [])
+        today_price_history = []
+        today_volume_history = []
+        previous_cumulative_volume = None
+
+        for sample in raw_intraday:
+            sample_ltp = _num(sample.get("ltp"))
+            cumulative_volume = int(_num(sample.get("volume")))
+            minute = str(sample.get("minute", "") or "").strip()
+
+            if sample_ltp <= 0 or not minute:
+                continue
+
+            if previous_cumulative_volume is None:
+                minute_volume = 0
+            else:
+                minute_volume = max(
+                    0,
+                    cumulative_volume - previous_cumulative_volume,
+                )
+
+            previous_cumulative_volume = cumulative_volume
+
+            # TodayPopup.jsx reads `date` for the X-axis and `minute` for
+            # the tooltip label. Keep both as HH:MM.
+            today_price_history.append({
+                "date": minute,
+                "minute": minute,
+                "ts": _num(sample.get("ts"), time.time()),
+                "value": sample_ltp,
+            })
+
+            today_volume_history.append({
+                "date": minute,
+                "minute": minute,
+                "ts": _num(sample.get("ts"), time.time()),
+                "value": minute_volume,
+            })
+
+        intraday_live = bool(today_price_history and current_ltp > 0)
+
         # Local UI receives only the same display-qualified candidates intended
         # for the mobile dashboard: buy pressure > 40% and gain < 3%.
         # Keep BTST and Swing as separate channel states so the UI never makes
@@ -193,7 +243,15 @@ def build_snapshot(engine):
             "news_source": active.get("news_source", ""),
             "price_history": price_history,
             "volume_history": volume_history,
+            "today_price_history": today_price_history,
+            "today_volume_history": today_volume_history,
+            "intraday_live": intraday_live,
             "metrics": {
+                "intraday_points": len(today_price_history),
+                "intraday_last_time": (
+                    today_price_history[-1]["minute"]
+                    if today_price_history else ""
+                ),
                 "current_volume": int(current_volume),
                 "avg_volume_5": avg_volume_5,
                 "avg_volume_10": avg_volume_10,

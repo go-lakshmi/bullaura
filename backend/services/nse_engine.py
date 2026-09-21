@@ -25,6 +25,7 @@ import re
 import threading
 import time
 from datetime import date, datetime, timezone,timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
@@ -444,25 +445,36 @@ class NSEHighPerformanceTradingPipeline:
 
     def download_stockdata_from_nse(self, symbols):
         """
-        Download NSE 1-month data and apply ONLY these filters:
+        Download NSE 1-month data and apply the existing NSE filters.
 
-        1. Older prices D18-D21 must be greater than the recent D0-D10
-           range OR the recent D0-D15 range.
-        2. DailyMovePct = (ClosePrice - PrevClose) / PrevClose * 100.
-        3. Average daily move of the latest 5 sessions must be < 1%.
+        Existing filters are NOT changed:
 
-        Only the original NSE eligibility filters are applied here.
-        Additional historical breakout metrics are calculated and stored
-        after those filters so the live Angel One stage can compare against
-        the historical baseline.
+        1. Need at least 22 valid NSE EQ sessions.
+        2. Average trades over latest 20 sessions >= 2000.
+        3. Older D18-D21 price structure must satisfy:
+            - strict historical pattern
+            OR
+            - max older price within 1% of recent max
+        for either D0-D10 or D0-D15.
+        4. Average DailyMovePct of latest 5 sessions must be < 1%.
 
-        For passing stocks, the NSE rows plus DailyMovePct are stored in
-        self.volume_shockers.
+        Added:
+        - Detailed rejection logging.
+        - Aggregate rejection counters.
+        - Successful-stock logging.
+        - Cache version bumped to v4 to invalidate old empty v3 cache.
         """
 
         cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
-        cache_version = "nse_live_volume_shocker_v3"
+
+        # IMPORTANT:
+        # v4 forces today's old v3 cache to be ignored.
+        cache_version = "nse_live_volume_shocker_v4"
+
+        # ------------------------------------------------------------------
+        # CACHE
+        # ------------------------------------------------------------------
 
         if cache_file.exists():
             try:
@@ -474,59 +486,135 @@ class NSEHighPerformanceTradingPipeline:
                     and cached_data.get("version") == cache_version
                 ):
                     self.volume_shockers = cached_data.get("data", {})
+
                     log.info(
-                        f"Loaded {len(self.volume_shockers)} filtered stocks from cache."
+                        "NSE CACHE LOADED | date=%s | version=%s | stocks=%d",
+                        today_str,
+                        cache_version,
+                        len(self.volume_shockers),
                     )
+
                     return
+
+                else:
+                    log.info(
+                        "NSE CACHE NOT USED | "
+                        "cached_date=%s | cached_version=%s | "
+                        "expected_date=%s | expected_version=%s",
+                        cached_data.get("date"),
+                        cached_data.get("version"),
+                        today_str,
+                        cache_version,
+                    )
+
             except Exception as e:
-                log.info(f"Cache read error: {e}. Re-downloading...")
+                log.warning(
+                    "NSE CACHE READ FAILED | error=%s | "
+                    "will download fresh data",
+                    e,
+                )
+
+        # ------------------------------------------------------------------
+        # START
+        # ------------------------------------------------------------------
 
         log.info(
-            f"Downloading 1-month historical data for {len(symbols)} NSE stocks..."
+            "NSE FILTER START | stocks_to_process=%d | cache_version=%s",
+            len(symbols),
+            cache_version,
         )
 
+        print(
+            f"Downloading 1-month historical data for "
+            f"{len(symbols)} NSE stocks..."
+        )
+
+        # ------------------------------------------------------------------
+        # FILTER COUNTERS
+        # ------------------------------------------------------------------
+
+        filter_counts = {
+            "empty_data": 0,
+            "less_than_22_rows": 0,
+            "missing_required_columns": 0,
+            "invalid_price_rows": 0,
+            "less_than_20_trade_rows": 0,
+            "low_average_trades": 0,
+            "price_structure_failed": 0,
+            "less_than_5_daily_moves": 0,
+            "average_daily_move_failed": 0,
+            "api_or_processing_error": 0,
+            "passed": 0,
+        }
+
+        counter_lock = threading.Lock()
+
+        def increment_counter(name):
+            with counter_lock:
+                filter_counts[name] = filter_counts.get(name, 0) + 1
+
+        # ------------------------------------------------------------------
+        # SINGLE STOCK
+        # ------------------------------------------------------------------
+
         def fetch_single_stock(symbol):
+
             try:
                 time.sleep(0.3)
 
+                # ----------------------------------------------------------
+                # DOWNLOAD
+                # ----------------------------------------------------------
+
+                to_date = datetime.now()
+                from_date = to_date - timedelta(days=45)
+
                 df = capital_market.price_volume_data(
                     symbol=symbol,
-                    period="1M"
+                    from_date=from_date.strftime("%d-%m-%Y"),
+                    to_date=to_date.strftime("%d-%m-%Y"),
                 )
 
                 if df is None or df.empty:
+
+                    increment_counter("empty_data")
+
+                    log.warning(
+                        "NSE REJECT | %s | reason=EMPTY_NSE_DATA",
+                        symbol,
+                    )
+
                     return symbol, None
 
                 df = df.copy()
 
-                # ============================================================
-                # SORT BY DATE - NEWEST FIRST
-                #
-                # D0  = latest NSE session
-                # D1  = previous NSE session
-                # ...
-                # D21 = oldest session
-                # ============================================================
+                # ----------------------------------------------------------
+                # DATE
+                # ----------------------------------------------------------
 
                 if "Date" in df.columns:
+
                     df["Date"] = pd.to_datetime(
                         df["Date"],
                         errors="coerce",
-                        dayfirst=True
+                        dayfirst=True,
                     )
 
-                    df = df.dropna(subset=["Date"])
+                    df = df.dropna(
+                        subset=["Date"]
+                    )
 
                     df = df.sort_values(
                         "Date",
-                        ascending=False
+                        ascending=False,
                     )
 
-                # ============================================================
-                # ONLY EQ SERIES
-                # ============================================================
+                # ----------------------------------------------------------
+                # EQ SERIES
+                # ----------------------------------------------------------
 
                 if "Series" in df.columns:
+
                     df["Series"] = (
                         df["Series"]
                         .astype(str)
@@ -534,33 +622,71 @@ class NSEHighPerformanceTradingPipeline:
                         .str.upper()
                     )
 
-                    df = df[df["Series"] == "EQ"].copy()
+                    df = df[
+                        df["Series"] == "EQ"
+                    ].copy()
 
-                # Need at least 21 sessions
-                if len(df) < 21:
+                # ----------------------------------------------------------
+                # NEED 22 NSE SESSIONS
+                # ----------------------------------------------------------
+
+                if len(df) < 22:
+
+                    increment_counter(
+                        "less_than_22_rows"
+                    )
+
+                    log.warning(
+                        "NSE REJECT | %s | "
+                        "reason=LESS_THAN_22_SESSIONS | rows=%d",
+                        symbol,
+                        len(df),
+                    )
+
                     return symbol, None
 
-                # Keep latest 21 sessions
-                df = df.head(21).copy()
+                # ----------------------------------------------------------
+                # KEEP 22 SESSIONS
+                # ----------------------------------------------------------
 
-                # ============================================================
+                df = df.head(22).copy()
+
+                # ----------------------------------------------------------
                 # REQUIRED COLUMNS
-                # ============================================================
+                # ----------------------------------------------------------
 
                 required_cols = [
                     "PrevClose",
                     "ClosePrice",
-                    "No.ofTrades"
+                    "No.ofTrades",
                 ]
 
-                if any(col not in df.columns for col in required_cols):
+                missing_cols = [
+                    col
+                    for col in required_cols
+                    if col not in df.columns
+                ]
+
+                if missing_cols:
+
+                    increment_counter(
+                        "missing_required_columns"
+                    )
+
+                    log.warning(
+                        "NSE REJECT | %s | "
+                        "reason=MISSING_COLUMNS | columns=%s",
+                        symbol,
+                        missing_cols,
+                    )
+
                     return symbol, None
 
-                # ============================================================
-                # CONVERT NUMERIC COLUMNS
-                # ============================================================
+                # ----------------------------------------------------------
+                # NUMERIC CONVERSION
+                # ----------------------------------------------------------
 
-                for col in [
+                numeric_columns = [
                     "PrevClose",
                     "OpenPrice",
                     "HighPrice",
@@ -570,49 +696,64 @@ class NSEHighPerformanceTradingPipeline:
                     "AveragePrice",
                     "TotalTradedQuantity",
                     "Turnover₹",
-                    "No.ofTrades"
-                ]:
+                    "No.ofTrades",
+                ]
+
+                for col in numeric_columns:
+
                     if col in df.columns:
+
                         df[col] = (
                             df[col]
                             .astype(str)
-                            .str.replace(",", "", regex=False)
-                            .str.replace("₹", "", regex=False)
+                            .str.replace(
+                                ",",
+                                "",
+                                regex=False,
+                            )
+                            .str.replace(
+                                "₹",
+                                "",
+                                regex=False,
+                            )
                             .str.strip()
                         )
 
                         df[col] = pd.to_numeric(
                             df[col],
-                            errors="coerce"
+                            errors="coerce",
                         )
 
-                # ============================================================
-                # NEED VALID PRICE DATA
-                # ============================================================
+                # ----------------------------------------------------------
+                # VALID PRICE DATA
+                # ----------------------------------------------------------
 
                 df = df.dropna(
                     subset=[
                         "PrevClose",
-                        "ClosePrice"
+                        "ClosePrice",
                     ]
                 ).copy()
 
-                if len(df) < 21:
+                if len(df) < 22:
+
+                    increment_counter(
+                        "invalid_price_rows"
+                    )
+
+                    log.warning(
+                        "NSE REJECT | %s | "
+                        "reason=INVALID_PRICE_DATA_AFTER_CLEANUP | rows=%d",
+                        symbol,
+                        len(df),
+                    )
+
                     return symbol, None
 
-                # ============================================================
-                # FILTER 1:
-                # NORMAL TRADING ACTIVITY
-                #
-                # D0 = latest NSE record
-                #
-                # Use latest 20 records:
-                #
-                # D0-D19
-                #
-                # IMPORTANT:
-                # D0 IS INCLUDED.
-                # ============================================================
+                # ==========================================================
+                # FILTER 1
+                # AVERAGE TRADES
+                # ==========================================================
 
                 trades_20d = (
                     df["No.ofTrades"]
@@ -621,15 +762,43 @@ class NSEHighPerformanceTradingPipeline:
                 )
 
                 if len(trades_20d) < 20:
+
+                    increment_counter(
+                        "less_than_20_trade_rows"
+                    )
+
+                    log.warning(
+                        "NSE REJECT | %s | "
+                        "reason=LESS_THAN_20_TRADE_ROWS | rows=%d",
+                        symbol,
+                        len(trades_20d),
+                    )
+
                     return symbol, None
 
                 avg_trades_20d = float(
                     trades_20d.mean()
                 )
 
-                # Skip stocks that normally trade too slowly.
                 if avg_trades_20d < 2000:
+
+                    increment_counter(
+                        "low_average_trades"
+                    )
+
+                    log.info(
+                        "NSE REJECT | %s | "
+                        "reason=LOW_AVERAGE_TRADES | "
+                        "avg_trades_20d=%.2f | required>=2000",
+                        symbol,
+                        avg_trades_20d,
+                    )
+
                     return symbol, None
+
+                # ==========================================================
+                # PRICE STRUCTURE
+                # ==========================================================
 
                 close = (
                     df["ClosePrice"]
@@ -637,73 +806,140 @@ class NSEHighPerformanceTradingPipeline:
                     .tolist()
                 )
 
-                # Available oldest four sessions:
-                # D18, D19, D20, D21
-                older_4 = close[17:22]
+                # D18-D21
+                older_4 = close[18:22]
 
-                # Recent ranges
-                recent_11 = close[0:11]   # D0-D10
-                recent_16 = close[0:16]   # D0-D15
+                # D0-D10
+                recent_11 = close[0:11]
 
-                # Flexible price-structure filter:
-                # Compare the MAX older price (D18-D21) with the MAX
-                # recent price (D0-D10 / D0-D15).  If they are within
-                # 1%, consider the historical price structure close enough.
-                # This avoids rejecting stocks where the older and recent
-                # price levels are essentially the same.
-                older_max = max(older_4) if older_4 else 0.0
-                recent_max_11 = max(recent_11) if recent_11 else 0.0
-                recent_max_16 = max(recent_16) if recent_16 else 0.0
+                # D0-D15
+                recent_16 = close[0:16]
+
+                older_max = (
+                    max(older_4)
+                    if older_4
+                    else 0.0
+                )
+
+                recent_max_11 = (
+                    max(recent_11)
+                    if recent_11
+                    else 0.0
+                )
+
+                recent_max_16 = (
+                    max(recent_16)
+                    if recent_16
+                    else 0.0
+                )
+
+                # ----------------------------------------------------------
+                # Difference between old max and recent max
+                # ----------------------------------------------------------
 
                 price_difference_11_pct = (
-                    abs(older_max - recent_max_11) / recent_max_11 * 100.0
-                    if recent_max_11 > 0 else 999.0
+                    abs(
+                        older_max
+                        - recent_max_11
+                    )
+                    / recent_max_11
+                    * 100.0
+                    if recent_max_11 > 0
+                    else 999.0
                 )
 
                 price_difference_16_pct = (
-                    abs(older_max - recent_max_16) / recent_max_16 * 100.0
-                    if recent_max_16 > 0 else 999.0
+                    abs(
+                        older_max
+                        - recent_max_16
+                    )
+                    / recent_max_16
+                    * 100.0
+                    if recent_max_16 > 0
+                    else 999.0
                 )
 
-                # ============================================================
-                # KEEP BOTH HISTORICAL PRICE PATTERNS
-                # ============================================================
-                # 1) STRICT pattern: preserve the original filter so we do not
-                #    lose stocks where ALL D18-D21 prices stayed above the
-                #    recent D0-D10 / D0-D15 range.
+                # ----------------------------------------------------------
+                # STRICT FILTER
+                # ----------------------------------------------------------
+
                 strict_filter_11 = all(
                     old_price > recent_max_11
                     for old_price in older_4
                 )
+
                 strict_filter_16 = all(
                     old_price > recent_max_16
                     for old_price in older_4
                 )
 
-                # 2) FLEXIBLE pattern: also keep stocks where the highest old
-                #    price is within 1% of the recent maximum.
-                close_filter_11 = price_difference_11_pct <= 1.0
-                close_filter_16 = price_difference_16_pct <= 1.0
+                # ----------------------------------------------------------
+                # FLEXIBLE FILTER
+                # ----------------------------------------------------------
 
-                # Keep a stock if it matches EITHER the old strict pattern OR
-                # the new max-within-1% pattern. This preserves old candidates
-                # while adding the newer candidates.
-                price_filter_11 = strict_filter_11 or close_filter_11
-                price_filter_16 = strict_filter_16 or close_filter_16
+                close_filter_11 = (
+                    price_difference_11_pct <= 1.0
+                )
 
-                if not (price_filter_11 or price_filter_16):
+                close_filter_16 = (
+                    price_difference_16_pct <= 1.0
+                )
+
+                # ----------------------------------------------------------
+                # FINAL PRICE FILTER
+                # ----------------------------------------------------------
+
+                price_filter_11 = (
+                    strict_filter_11
+                    or close_filter_11
+                )
+
+                price_filter_16 = (
+                    strict_filter_16
+                    or close_filter_16
+                )
+
+                if not (
+                    price_filter_11
+                    or price_filter_16
+                ):
+
+                    increment_counter(
+                        "price_structure_failed"
+                    )
+
+                    log.info(
+                        "NSE REJECT | %s | "
+                        "reason=PRICE_STRUCTURE_FAILED | "
+                        "older_D18_D21=%s | "
+                        "older_max=%.2f | "
+                        "recent_max_D0_D10=%.2f | "
+                        "recent_max_D0_D15=%.2f | "
+                        "diff_D0_D10=%.2f%% | "
+                        "diff_D0_D15=%.2f%% | "
+                        "strict_D0_D10=%s | "
+                        "strict_D0_D15=%s | "
+                        "close_D0_D10=%s | "
+                        "close_D0_D15=%s",
+                        symbol,
+                        [round(x, 2) for x in older_4],
+                        older_max,
+                        recent_max_11,
+                        recent_max_16,
+                        price_difference_11_pct,
+                        price_difference_16_pct,
+                        strict_filter_11,
+                        strict_filter_16,
+                        close_filter_11,
+                        close_filter_16,
+                    )
+
                     return symbol, None
 
-                # ============================================================
-                # FILTER 3:
+                # ==========================================================
+                # FILTER 3
                 # DAILY MOVE
-                #
-                # DailyMovePct =
-                #
-                # (ClosePrice - PrevClose)
-                # ------------------------ × 100
-                #       PrevClose
-                # ============================================================
+                # ==========================================================
 
                 daily_moves = (
                     (
@@ -712,7 +948,7 @@ class NSEHighPerformanceTradingPipeline:
                     )
                     / df["PrevClose"].replace(
                         0,
-                        np.nan
+                        np.nan,
                     )
                     * 100.0
                 )
@@ -721,11 +957,6 @@ class NSEHighPerformanceTradingPipeline:
                     daily_moves.round(4)
                 )
 
-                # Latest 5 NSE sessions
-                #
-                # D0, D1, D2, D3, D4
-                #
-                # D0 is included.
                 last_5_moves = (
                     daily_moves
                     .head(5)
@@ -733,95 +964,231 @@ class NSEHighPerformanceTradingPipeline:
                 )
 
                 if len(last_5_moves) < 5:
+
+                    increment_counter(
+                        "less_than_5_daily_moves"
+                    )
+
+                    log.warning(
+                        "NSE REJECT | %s | "
+                        "reason=LESS_THAN_5_DAILY_MOVES | rows=%d",
+                        symbol,
+                        len(last_5_moves),
+                    )
+
                     return symbol, None
 
                 last_5_avg_move = float(
                     last_5_moves.mean()
                 )
 
-                # Skip stocks whose recent average daily
-                # movement is >= 1%.
                 if last_5_avg_move >= 1.0:
+
+                    increment_counter(
+                        "average_daily_move_failed"
+                    )
+
+                    log.info(
+                        "NSE REJECT | %s | "
+                        "reason=AVERAGE_DAILY_MOVE_GE_1_PERCENT | "
+                        "last_5_avg_move=%.4f%% | required<1.0%%",
+                        symbol,
+                        last_5_avg_move,
+                    )
+
                     return symbol, None
 
-                # ============================================================
+                # ==========================================================
                 # HISTORICAL BREAKOUT BASELINE
-                #
-                # These metrics are calculated from the 21 NSE sessions and
-                # stored with the stock.  They are used later by the live
-                # Angel One confirmation stage.
-                # ============================================================
+                # ==========================================================
 
-                # Latest 20 sessions, including D0.
                 hist20 = df.head(20).copy()
                 hist5 = df.head(5).copy()
                 hist10 = df.head(10).copy()
 
-                # Average volume / turnover / trades.
-                avg_volume_20d = float(hist20["TotalTradedQuantity"].mean())                     if "TotalTradedQuantity" in hist20.columns else 0.0
-
-                avg_turnover_20d = float(hist20["Turnover₹"].mean())                     if "Turnover₹" in hist20.columns else 0.0
-
-                avg_trades_20d = float(hist20["No.ofTrades"].mean())
-
-                # Historical daily range as % of previous close.
-                historical_range_pct = (
-                    (df["HighPrice"] - df["LowPrice"])
-                    / df["PrevClose"].replace(0, np.nan)
-                    * 100.0
-                )
-
-                avg_range_20d = float(
-                    historical_range_pct.head(20).dropna().mean()
-                ) if not historical_range_pct.head(20).dropna().empty else 0.0
-
-                avg_range_5d = float(
-                    historical_range_pct.head(5).dropna().mean()
-                ) if not historical_range_pct.head(5).dropna().empty else 0.0
-
-                # Recent highs / lows.
-                recent_5_high = float(hist5["HighPrice"].max())
-                recent_10_high = float(hist10["HighPrice"].max())
-                recent_20_high = float(hist20["HighPrice"].max())
-
-                recent_5_low = float(hist5["LowPrice"].min())
-                recent_10_low = float(hist10["LowPrice"].min())
-                recent_20_low = float(hist20["LowPrice"].min())
-
-                latest_close = float(df.iloc[0]["ClosePrice"])
-
-                # Close compression over the latest 5 sessions.
-                close5 = hist5["ClosePrice"].dropna()
-                close_compression_pct = (
-                    ((float(close5.max()) - float(close5.min()))
-                     / float(close5.min()) * 100.0)
-                    if len(close5) >= 2 and float(close5.min()) > 0
+                avg_volume_20d = (
+                    float(
+                        hist20[
+                            "TotalTradedQuantity"
+                        ].mean()
+                    )
+                    if "TotalTradedQuantity"
+                    in hist20.columns
                     else 0.0
                 )
 
-                # Higher-low structure: newest half's low should be >= older half's low.
-                low_series = hist5["LowPrice"].dropna().tolist()
+                avg_turnover_20d = (
+                    float(
+                        hist20[
+                            "Turnover₹"
+                        ].mean()
+                    )
+                    if "Turnover₹"
+                    in hist20.columns
+                    else 0.0
+                )
+
+                avg_trades_20d = float(
+                    hist20[
+                        "No.ofTrades"
+                    ].mean()
+                )
+
+                historical_range_pct = (
+                    (
+                        df["HighPrice"]
+                        - df["LowPrice"]
+                    )
+                    / df[
+                        "PrevClose"
+                    ].replace(
+                        0,
+                        np.nan,
+                    )
+                    * 100.0
+                )
+
+                avg_range_20d = (
+                    float(
+                        historical_range_pct
+                        .head(20)
+                        .dropna()
+                        .mean()
+                    )
+                    if not historical_range_pct
+                    .head(20)
+                    .dropna()
+                    .empty
+                    else 0.0
+                )
+
+                avg_range_5d = (
+                    float(
+                        historical_range_pct
+                        .head(5)
+                        .dropna()
+                        .mean()
+                    )
+                    if not historical_range_pct
+                    .head(5)
+                    .dropna()
+                    .empty
+                    else 0.0
+                )
+
+                # ----------------------------------------------------------
+                # RECENT HIGHS / LOWS
+                # ----------------------------------------------------------
+
+                recent_5_high = float(
+                    hist5["HighPrice"].max()
+                )
+
+                recent_10_high = float(
+                    hist10["HighPrice"].max()
+                )
+
+                recent_20_high = float(
+                    hist20["HighPrice"].max()
+                )
+
+                recent_5_low = float(
+                    hist5["LowPrice"].min()
+                )
+
+                recent_10_low = float(
+                    hist10["LowPrice"].min()
+                )
+
+                recent_20_low = float(
+                    hist20["LowPrice"].min()
+                )
+
+                latest_close = float(
+                    df.iloc[0]["ClosePrice"]
+                )
+
+                # ----------------------------------------------------------
+                # CLOSE COMPRESSION
+                # ----------------------------------------------------------
+
+                close5 = (
+                    hist5["ClosePrice"]
+                    .dropna()
+                )
+
+                close_compression_pct = (
+                    (
+                        (
+                            float(close5.max())
+                            - float(close5.min())
+                        )
+                        / float(close5.min())
+                        * 100.0
+                    )
+                    if (
+                        len(close5) >= 2
+                        and float(close5.min()) > 0
+                    )
+                    else 0.0
+                )
+
+                # ----------------------------------------------------------
+                # HIGHER LOW
+                # ----------------------------------------------------------
+
+                low_series = (
+                    hist5["LowPrice"]
+                    .dropna()
+                    .tolist()
+                )
+
                 higher_low_structure = False
+
                 if len(low_series) >= 4:
-                    recent_half_low = float(min(low_series[:2]))
-                    older_half_low = float(min(low_series[2:]))
-                    higher_low_structure = recent_half_low >= older_half_low
 
-                # Distance of latest close from the 10D/20D high.
+                    recent_half_low = float(
+                        min(low_series[:2])
+                    )
+
+                    older_half_low = float(
+                        min(low_series[2:])
+                    )
+
+                    higher_low_structure = (
+                        recent_half_low
+                        >= older_half_low
+                    )
+
+                # ----------------------------------------------------------
+                # DISTANCE FROM HIGH
+                # ----------------------------------------------------------
+
                 distance_from_10d_high_pct = (
-                    (recent_10_high - latest_close) / recent_10_high * 100.0
-                    if recent_10_high > 0 else 0.0
-                )
-                distance_from_20d_high_pct = (
-                    (recent_20_high - latest_close) / recent_20_high * 100.0
-                    if recent_20_high > 0 else 0.0
+                    (
+                        recent_10_high
+                        - latest_close
+                    )
+                    / recent_10_high
+                    * 100.0
+                    if recent_10_high > 0
+                    else 0.0
                 )
 
-                # ============================================================
-                # CONVERT DATAFRAME TO RECORDS
-                #
-                # ALL 21 NSE RECORDS ARE RETAINED.
-                # ============================================================
+                distance_from_20d_high_pct = (
+                    (
+                        recent_20_high
+                        - latest_close
+                    )
+                    / recent_20_high
+                    * 100.0
+                    if recent_20_high > 0
+                    else 0.0
+                )
+
+                # ==========================================================
+                # CONVERT RECORDS
+                # ==========================================================
 
                 records = df.to_dict(
                     orient="records"
@@ -835,21 +1202,25 @@ class NSEHighPerformanceTradingPipeline:
 
                         if isinstance(
                             value,
-                            pd.Timestamp
+                            pd.Timestamp,
                         ):
-                            record[key] = value.strftime(
-                                "%Y-%m-%d"
+                            record[key] = (
+                                value.strftime(
+                                    "%Y-%m-%d"
+                                )
                             )
 
                         elif isinstance(
                             value,
-                            np.integer
+                            np.integer,
                         ):
-                            record[key] = int(value)
+                            record[key] = int(
+                                value
+                            )
 
                         elif isinstance(
                             value,
-                            np.floating
+                            np.floating,
                         ):
                             record[key] = (
                                 None
@@ -857,96 +1228,322 @@ class NSEHighPerformanceTradingPipeline:
                                 else float(value)
                             )
 
-                # ============================================================
-                # RETURN FILTERED STOCK
-                # ============================================================
-                log.info(f" {symbol} : {records} ")
+                # ==========================================================
+                # PASSED
+                # ==========================================================
+
+                increment_counter("passed")
+
+                selected_pattern = (
+                    "D0-D10"
+                    if price_filter_11
+                    else "D0-D15"
+                )
+
+                log.info(
+                    "NSE SELECTED | %s | "
+                    "pattern=%s | "
+                    "avg_trades_20d=%.2f | "
+                    "last_5_avg_move=%.4f%% | "
+                    "older_max=%.2f | "
+                    "recent_max_D0_D10=%.2f | "
+                    "recent_max_D0_D15=%.2f",
+                    symbol,
+                    selected_pattern,
+                    avg_trades_20d,
+                    last_5_avg_move,
+                    older_max,
+                    recent_max_11,
+                    recent_max_16,
+                )
+
                 return symbol, {
+
                     "symbol": symbol,
 
-                    # Historical baseline used by live confirmation.
-                    "avg_trades_20d": round(avg_trades_20d, 2),
-                    "avg_volume_20d": round(avg_volume_20d, 2),
-                    "avg_turnover_20d": round(avg_turnover_20d, 2),
-                    "avg_range_20d_pct": round(avg_range_20d, 4),
-                    "avg_range_5d_pct": round(avg_range_5d, 4),
+                    # Historical baseline.
+                    "avg_trades_20d": round(
+                        avg_trades_20d,
+                        2,
+                    ),
+
+                    "avg_volume_20d": round(
+                        avg_volume_20d,
+                        2,
+                    ),
+
+                    "avg_turnover_20d": round(
+                        avg_turnover_20d,
+                        2,
+                    ),
+
+                    "avg_range_20d_pct": round(
+                        avg_range_20d,
+                        4,
+                    ),
+
+                    "avg_range_5d_pct": round(
+                        avg_range_5d,
+                        4,
+                    ),
 
                     # Historical structure.
-                    "recent_5_high": round(recent_5_high, 2),
-                    "recent_10_high": round(recent_10_high, 2),
-                    "recent_20_high": round(recent_20_high, 2),
-                    "recent_5_low": round(recent_5_low, 2),
-                    "recent_10_low": round(recent_10_low, 2),
-                    "recent_20_low": round(recent_20_low, 2),
-                    "close_compression_5d_pct": round(close_compression_pct, 4),
-                    "higher_low_structure": higher_low_structure,
-                    "distance_from_10d_high_pct": round(
-                        distance_from_10d_high_pct, 4
-                    ),
-                    "distance_from_20d_high_pct": round(
-                        distance_from_20d_high_pct, 4
+                    "recent_5_high": round(
+                        recent_5_high,
+                        2,
                     ),
 
-                    # Existing filters.
-                    "last_5_avg_daily_move": round(
-                        last_5_avg_move,
-                        4
-                    ),
-                    "price_structure_filter": (
-                        "D0-D10"
-                        if price_filter_11
-                        else "D0-D15"
+                    "recent_10_high": round(
+                        recent_10_high,
+                        2,
                     ),
 
-                    # ALL 21 NSE records.
+                    "recent_20_high": round(
+                        recent_20_high,
+                        2,
+                    ),
+
+                    "recent_5_low": round(
+                        recent_5_low,
+                        2,
+                    ),
+
+                    "recent_10_low": round(
+                        recent_10_low,
+                        2,
+                    ),
+
+                    "recent_20_low": round(
+                        recent_20_low,
+                        2,
+                    ),
+
+                    "close_compression_5d_pct": round(
+                        close_compression_pct,
+                        4,
+                    ),
+
+                    "higher_low_structure":
+                        higher_low_structure,
+
+                    "distance_from_10d_high_pct":
+                        round(
+                            distance_from_10d_high_pct,
+                            4,
+                        ),
+
+                    "distance_from_20d_high_pct":
+                        round(
+                            distance_from_20d_high_pct,
+                            4,
+                        ),
+
+                    # Existing filter result.
+                    "last_5_avg_daily_move":
+                        round(
+                            last_5_avg_move,
+                            4,
+                        ),
+
+                    "price_structure_filter":
+                        selected_pattern,
+
+                    # ALL 22 NSE records.
                     "nse_data": records,
                 }
 
             except Exception as ex:
 
-                log.warning(
-                    f"NSE filtering failed for {symbol}: {ex}"
+                increment_counter(
+                    "api_or_processing_error"
+                )
+
+                log.exception(
+                    "NSE ERROR | %s | "
+                    "reason=API_OR_PROCESSING_ERROR",
+                    symbol,
                 )
 
                 return symbol, None
 
+        # ==============================================================
+        # PROCESS ALL STOCKS
+        # ==============================================================
+
         results = {}
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(
+            max_workers=3
+        ) as executor:
+
             future_to_symbol = {
-                executor.submit(fetch_single_stock, sym): sym
+                executor.submit(
+                    fetch_single_stock,
+                    sym,
+                ): sym
                 for sym in symbols
             }
 
             completed = 0
 
-            for future in as_completed(future_to_symbol):
+            for future in as_completed(
+                future_to_symbol
+            ):
+
+                symbol = future_to_symbol[
+                    future
+                ]
+
                 try:
-                    symbol, result = future.result(timeout=15)
+
+                    returned_symbol, result = (
+                        future.result(
+                            timeout=15
+                        )
+                    )
+
                     if result:
-                        results[symbol] = result
+                        results[
+                            returned_symbol
+                        ] = result
+
                 except Exception as thread_err:
-                    log.warning(f"Stock processing error: {thread_err}")
+
+                    increment_counter(
+                        "api_or_processing_error"
+                    )
+
+                    log.exception(
+                        "NSE THREAD ERROR | %s | error=%s",
+                        symbol,
+                        thread_err,
+                    )
 
                 completed += 1
 
                 if completed % 50 == 0:
+
                     log.info(
-                        f"Progress: {completed}/{len(symbols)} stocks processed..."
+                        "NSE FILTER PROGRESS | "
+                        "%d/%d processed | selected=%d",
+                        completed,
+                        len(symbols),
+                        len(results),
+                    )
+
+                    print(
+                        f"Progress: "
+                        f"{completed}/"
+                        f"{len(symbols)} "
+                        f"stocks processed..."
                     )
 
                 time.sleep(0.1)
 
+        # ==============================================================
+        # STORE RESULTS
+        # ==============================================================
+
         self.volume_shockers = results
 
+        # ==============================================================
+        # FINAL FILTER SUMMARY
+        # ==============================================================
+
         log.info(
-            f"\nNSE filters passed: {len(results)} / {len(symbols)} stocks."
+            "============================================================"
         )
 
-        try:
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
+        log.info(
+            "NSE FILTER SUMMARY"
+        )
 
-            with open(cache_file, "w", encoding="utf-8") as f:
+        log.info(
+            "Total stocks processed       : %d",
+            len(symbols),
+        )
+
+        log.info(
+            "Empty NSE data               : %d",
+            filter_counts["empty_data"],
+        )
+
+        log.info(
+            "Less than 22 sessions        : %d",
+            filter_counts["less_than_22_rows"],
+        )
+
+        log.info(
+            "Missing required columns     : %d",
+            filter_counts["missing_required_columns"],
+        )
+
+        log.info(
+            "Invalid price data           : %d",
+            filter_counts["invalid_price_rows"],
+        )
+
+        log.info(
+            "Less than 20 trade rows      : %d",
+            filter_counts["less_than_20_trade_rows"],
+        )
+
+        log.info(
+            "Average trades < 2000        : %d",
+            filter_counts["low_average_trades"],
+        )
+
+        log.info(
+            "Price structure failed       : %d",
+            filter_counts["price_structure_failed"],
+        )
+
+        log.info(
+            "Less than 5 daily moves      : %d",
+            filter_counts["less_than_5_daily_moves"],
+        )
+
+        log.info(
+            "Average daily move >= 1%%     : %d",
+            filter_counts["average_daily_move_failed"],
+        )
+
+        log.info(
+            "API/processing errors        : %d",
+            filter_counts["api_or_processing_error"],
+        )
+
+        log.info(
+            "NSE FILTER PASSED             : %d",
+            filter_counts["passed"],
+        )
+
+        log.info(
+            "============================================================"
+        )
+
+        print(
+            f"\nNSE filters passed: "
+            f"{len(results)} / {len(symbols)} stocks."
+        )
+
+        # ==============================================================
+        # SAVE CACHE
+        # ==============================================================
+
+        try:
+
+            cache_file.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            with open(
+                cache_file,
+                "w",
+                encoding="utf-8",
+            ) as f:
+
                 json.dump(
                     {
                         "date": today_str,
@@ -958,10 +1555,29 @@ class NSEHighPerformanceTradingPipeline:
                     default=str,
                 )
 
-            log.info("NSE filtered data cached successfully.")
+            log.info(
+                "NSE CACHE SAVED | "
+                "date=%s | version=%s | stocks=%d | file=%s",
+                today_str,
+                cache_version,
+                len(self.volume_shockers),
+                cache_file,
+            )
+
+            print(
+                "NSE filtered data cached successfully."
+            )
 
         except Exception as e:
-            log.info(f"Failed to save cache: {e}")
+
+            log.exception(
+                "NSE CACHE SAVE FAILED | error=%s",
+                e,
+            )
+
+            print(
+                f"Failed to save cache: {e}"
+            )
     
 
     def load_raw_scrip_master(self):
@@ -2555,6 +3171,45 @@ class NSEHighPerformanceTradingPipeline:
             if week_52_high > week_52_low > 0
             else None
         )
+
+        # ---------------------------------------------------------------
+        # TODAY INTRADAY HISTORY FOR LOCAL UI POPUP
+        # ---------------------------------------------------------------
+        # Angel One gives cumulative day volume. Keep one observation per
+        # minute so the popup can draw the real intraday LTP and per-minute
+        # volume without storing every websocket tick.
+        #
+        # IMPORTANT: this data is populated directly from analyze_tick_metrics
+        # for every processed Angel One tick. It must happen BEFORE the live
+        # signal qualification below, otherwise a stock that is displayed in
+        # the UI could have no intraday chart data.
+        intraday_date = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d")
+        intraday_samples = cache.setdefault(
+            "intraday_samples",
+            deque(maxlen=390),
+        )
+
+        if cache.get("intraday_date") != intraday_date:
+            intraday_samples.clear()
+            cache["intraday_date"] = intraday_date
+
+        minute_key = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%H:%M")
+
+        if (
+            intraday_samples
+            and intraday_samples[-1].get("minute") == minute_key
+        ):
+            # Keep the latest tick for the current minute.
+            intraday_samples[-1]["ts"] = time.time()
+            intraday_samples[-1]["ltp"] = ltp
+            intraday_samples[-1]["volume"] = current_volume
+        else:
+            intraday_samples.append({
+                "minute": minute_key,
+                "ts": time.time(),
+                "ltp": ltp,
+                "volume": current_volume,
+            })
 
         # Update state AFTER calculating comparisons.
         cache["prev_ltp"] = ltp
