@@ -889,14 +889,74 @@ class NSEHighPerformanceTradingPipeline:
                 # FINAL PRICE FILTER
                 # ----------------------------------------------------------
 
+                # ----------------------------------------------------------
+                # STABILIZED DECLINE FILTER
+                #
+                # Allow stocks that have declined meaningfully from the older
+                # price zone but have started stabilizing in the recent window.
+                # Existing strict and 1% close filters remain unchanged.
+                # ----------------------------------------------------------
+
+                recent_min_11 = min(recent_11) if recent_11 else 0.0
+                recent_min_16 = min(recent_16) if recent_16 else 0.0
+
+                prior_decline_pct_11 = (
+                    ((older_max - recent_max_11) / older_max) * 100.0
+                    if older_max > 0 else 0.0
+                )
+                prior_decline_pct_16 = (
+                    ((older_max - recent_max_16) / older_max) * 100.0
+                    if older_max > 0 else 0.0
+                )
+
+                recent_range_pct_11 = (
+                    ((recent_max_11 - recent_min_11) / recent_max_11) * 100.0
+                    if recent_max_11 > 0 else 999.0
+                )
+                recent_range_pct_16 = (
+                    ((recent_max_16 - recent_min_16) / recent_max_16) * 100.0
+                    if recent_max_16 > 0 else 999.0
+                )
+
+                recent_3_11 = recent_11[:3]
+                recent_3_16 = recent_16[:3]
+
+                recent_recovery_11 = (
+                    len(recent_3_11) >= 3
+                    and recent_3_11[0] >= recent_3_11[1] * 0.99
+                    and recent_3_11[0] >= recent_3_11[2] * 0.99
+                )
+                recent_recovery_16 = (
+                    len(recent_3_16) >= 3
+                    and recent_3_16[0] >= recent_3_16[1] * 0.99
+                    and recent_3_16[0] >= recent_3_16[2] * 0.99
+                )
+
+                stabilized_decline_11 = (
+                    prior_decline_pct_11 >= 5.0
+                    and recent_range_pct_11 <= 8.0
+                    and recent_recovery_11
+                )
+                stabilized_decline_16 = (
+                    prior_decline_pct_16 >= 5.0
+                    and recent_range_pct_16 <= 8.0
+                    and recent_recovery_16
+                )
+
+                # ----------------------------------------------------------
+                # FINAL PRICE FILTER
+                # ----------------------------------------------------------
+
                 price_filter_11 = (
                     strict_filter_11
                     or close_filter_11
+                    or stabilized_decline_11
                 )
 
                 price_filter_16 = (
                     strict_filter_16
                     or close_filter_16
+                    or stabilized_decline_16
                 )
 
                 if not (
@@ -920,7 +980,13 @@ class NSEHighPerformanceTradingPipeline:
                         "strict_D0_D10=%s | "
                         "strict_D0_D15=%s | "
                         "close_D0_D10=%s | "
-                        "close_D0_D15=%s",
+                        "close_D0_D15=%s | "
+                        "stabilized_D0_D10=%s | "
+                        "stabilized_D0_D15=%s | "
+                        "prior_decline_D0_D10=%.2f%% | "
+                        "prior_decline_D0_D15=%.2f%% | "
+                        "recent_range_D0_D10=%.2f%% | "
+                        "recent_range_D0_D15=%.2f%%",
                         symbol,
                         [round(x, 2) for x in older_4],
                         older_max,
@@ -932,6 +998,12 @@ class NSEHighPerformanceTradingPipeline:
                         strict_filter_16,
                         close_filter_11,
                         close_filter_16,
+                        stabilized_decline_11,
+                        stabilized_decline_16,
+                        prior_decline_pct_11,
+                        prior_decline_pct_16,
+                        recent_range_pct_11,
+                        recent_range_pct_16,
                     )
 
                     return symbol, None
@@ -1234,11 +1306,18 @@ class NSEHighPerformanceTradingPipeline:
 
                 increment_counter("passed")
 
-                selected_pattern = (
-                    "D0-D10"
-                    if price_filter_11
-                    else "D0-D15"
-                )
+                if strict_filter_11:
+                    selected_pattern = "D0-D10"
+                elif close_filter_11:
+                    selected_pattern = "D0-D10_CLOSE"
+                elif stabilized_decline_11:
+                    selected_pattern = "D0-D10_STABILIZED_DECLINE"
+                elif strict_filter_16:
+                    selected_pattern = "D0-D15"
+                elif close_filter_16:
+                    selected_pattern = "D0-D15_CLOSE"
+                else:
+                    selected_pattern = "D0-D15_STABILIZED_DECLINE"
 
                 log.info(
                     "NSE SELECTED | %s | "
@@ -1247,7 +1326,11 @@ class NSEHighPerformanceTradingPipeline:
                     "last_5_avg_move=%.4f%% | "
                     "older_max=%.2f | "
                     "recent_max_D0_D10=%.2f | "
-                    "recent_max_D0_D15=%.2f",
+                    "recent_max_D0_D15=%.2f | "
+                    "prior_decline_D0_D10=%.2f%% | "
+                    "prior_decline_D0_D15=%.2f%% | "
+                    "recent_range_D0_D10=%.2f%% | "
+                    "recent_range_D0_D15=%.2f%%",
                     symbol,
                     selected_pattern,
                     avg_trades_20d,
@@ -1255,6 +1338,10 @@ class NSEHighPerformanceTradingPipeline:
                     older_max,
                     recent_max_11,
                     recent_max_16,
+                    prior_decline_pct_11,
+                    prior_decline_pct_16,
+                    recent_range_pct_11,
+                    recent_range_pct_16,
                 )
 
                 return symbol, {
@@ -1347,6 +1434,24 @@ class NSEHighPerformanceTradingPipeline:
 
                     "price_structure_filter":
                         selected_pattern,
+
+                    "prior_decline_d0_d10_pct":
+                        round(prior_decline_pct_11, 4),
+
+                    "prior_decline_d0_d15_pct":
+                        round(prior_decline_pct_16, 4),
+
+                    "recent_range_d0_d10_pct":
+                        round(recent_range_pct_11, 4),
+
+                    "recent_range_d0_d15_pct":
+                        round(recent_range_pct_16, 4),
+
+                    "stabilized_decline_d0_d10":
+                        stabilized_decline_11,
+
+                    "stabilized_decline_d0_d15":
+                        stabilized_decline_16,
 
                     # ALL 22 NSE records.
                     "nse_data": records,

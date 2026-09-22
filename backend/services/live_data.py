@@ -192,8 +192,7 @@ def build_snapshot(engine):
             if not candidate:
                 return False
             return (
-                _num(candidate.get("buy")) > 40.0
-                and _num(candidate.get("gain")) < 3.0
+                _num(candidate.get("gain")) < 3.0
             )
 
         btst_display = btst_signal if display_qualified(btst_signal) else {}
