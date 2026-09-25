@@ -1,407 +1,35 @@
 # engine/scanner.py
-from nselib import capital_market
-import pandas as pd
-import time
-import queue
-import threading
-import pandas as pd
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from backend.config.logger import logger as log
-from SmartApi.smartWebSocketV2 import SmartWebSocketV2
-from backend.services.mobile_dashboard import MobileDashboard
-import os
+from typing import List, Optional
+from zoneinfo import ZoneInfo
 import io
 import json
-import json
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-from nselib import capital_market
-import pandas as pd
-import logging
-import math
-import os
+import queue
 import re
 import threading
 import time
-from datetime import date, datetime, timezone,timedelta
-from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
-import traceback
-from collections import deque
+from nselib import capital_market
+from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
-class FreeNewsManager:
-    """
-    Free news layer for the top technical candidates.
+from backend.config.logger import logger as log
 
-    Sources:
-      1) NSE corporate-announcement endpoint (primary).
-      2) yfinance/Yahoo news (secondary).
-
-    News is cached locally for NEWS_TTL_SECONDS so the live tick loop never
-    makes a news request on every tick or every 60-second dispatch.
-    """
-
-    NEWS_TTL_SECONDS = 10 * 60
-    NEWS_WINDOW_SECONDS = 24 * 60 * 60
-
-    POSITIVE_TERMS = (
-        "order", "contract", "bagging", "award", "won", "wins",
-        "acquisition", "acquire", "approval", "approved", "partnership",
-        "strategic", "capacity expansion", "expansion", "commission",
-        "launch", "record", "strong results", "profit", "revenue growth",
-        "fund raise", "fundraising", "investment", "joint venture",
-    )
-    NEGATIVE_TERMS = (
-        "penalty", "fine", "investigation", "fraud", "default", "downgrade",
-        "resignation", "arrest", "regulatory action", "show cause",
-        "order cancellation", "cancelled", "canceled", "shutdown",
-        "loss", "weak results", "decline", "debt", "insolvency",
-        "rating downgrade", "sebi action", "ed action",
-    )
-    MIXED_TERMS = (
-        "clarification", "media report", "rumour", "rumor", "litigation",
-        "court", "dispute", "settlement", "restructuring",
-    )
-
-    def __init__(self):
-        self.lock = threading.Lock()
-        self.cache = {}
-        self.last_refresh = 0.0
-        self.refresh_in_progress = False
-
-    @staticmethod
-    def _clean_symbol(symbol):
-        return str(symbol or "").upper().replace(".NS", "").replace(".BO", "").strip()
-
-    @staticmethod
-    def _text(value):
-        if value is None:
-            return ""
-        return " ".join(str(value).replace("\n", " ").split()).strip()
-
-    def _classify(self, title, summary=""):
-        text = f"{title} {summary}".lower()
-        positive = sum(1 for term in self.POSITIVE_TERMS if term in text)
-        negative = sum(1 for term in self.NEGATIVE_TERMS if term in text)
-        mixed = sum(1 for term in self.MIXED_TERMS if term in text)
-
-        if positive and negative:
-            return "mixed"
-        if negative >= 1 and negative >= positive:
-            return "negative"
-        if positive >= 1 and positive > negative:
-            return "positive"
-        if mixed:
-            return "mixed"
-        return "none"
-
-    def _merge_status(self, current, new_status):
-        if current == "none":
-            return new_status
-        if new_status == "none" or new_status == current:
-            return current
-        return "mixed"
-
-    def _store_article(
-        self,
-        symbol,
-        title,
-        summary="",
-        source="",
-        published_at=None,
-        require_timestamp=False,
-    ):
-        symbol = self._clean_symbol(symbol)
-        if not symbol:
-            return
-
-        # Keep only fresh news. yfinance normally supplies
-        # providerPublishTime; NSE supplies broadcast/an_dt style timestamps.
-        if published_at is not None:
-            try:
-                published_ts = float(published_at)
-                if published_ts > 10_000_000_000:
-                    published_ts /= 1000.0
-                if time.time() - published_ts > self.NEWS_WINDOW_SECONDS:
-                    return
-                if published_ts > time.time() + 300:
-                    return
-            except (TypeError, ValueError):
-                if require_timestamp:
-                    return
-        elif require_timestamp:
-            return
-
-        status = self._classify(title, summary)
-        if status == "none":
-            return
-
-        item = {
-            "symbol": symbol,
-            "status": status,
-            "title": self._text(title)[:240],
-            "source": self._text(source)[:80],
-            "updated_at": time.time(),
-        }
-        with self.lock:
-            old = self.cache.get(symbol, {
-                "status": "none",
-                "title": "",
-                "source": "",
-                "updated_at": 0.0,
-            })
-            old["status"] = self._merge_status(old.get("status", "none"), status)
-            old["title"] = item["title"]
-            old["source"] = item["source"]
-            old["updated_at"] = item["updated_at"]
-            self.cache[symbol] = old
-
-    def _fetch_nse(self, symbols):
-        """
-        Fetch NSE corporate announcements once for the whole candidate set.
-
-        NSE's public corporate-filings page exposes Symbol / Subject /
-        Broadcast Date-Time. The endpoint is intentionally treated
-        defensively because NSE can change its response schema.
-        """
-        if not symbols:
-            return
-
-        url = "https://www.nseindia.com/api/corporate-announcements"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            "Accept": "application/json,text/plain,*/*",
-            "Referer": "https://www.nseindia.com/companies-listing/"
-                       "corporate-filings-application?id=allAnnouncements",
-        }
-
-        session = requests.Session()
-        try:
-            session.get(
-                "https://www.nseindia.com/",
-                headers=headers,
-                timeout=8,
-            )
-            response = session.get(
-                url,
-                headers=headers,
-                params={"index": "equities"},
-                timeout=10,
-            )
-            response.raise_for_status()
-            payload = response.json()
-
-            rows = payload if isinstance(payload, list) else (
-                payload.get("data", []) if isinstance(payload, dict) else []
-            )
-            symbol_set = {self._clean_symbol(s) for s in symbols}
-
-            for row in rows:
-                if not isinstance(row, dict):
-                    continue
-                symbol = self._clean_symbol(
-                    row.get("symbol") or row.get("sym") or row.get("symbolName")
-                )
-                if symbol not in symbol_set:
-                    continue
-
-                title = (
-                    row.get("subject")
-                    or row.get("desc")
-                    or row.get("description")
-                    or row.get("sm_name")
-                    or ""
-                )
-                summary = row.get("details") or row.get("desc") or ""
-                published_at = (
-                    row.get("broadcastDateTime")
-                    or row.get("broadcast_date_time")
-                    or row.get("an_dt")
-                    or row.get("sort_date")
-                    or row.get("date")
-                )
-
-                # NSE commonly returns an ISO/date string rather than Unix time.
-                if published_at and not isinstance(published_at, (int, float)):
-                    parsed = None
-                    for fmt in (
-                        "%d-%b-%Y %H:%M:%S",
-                        "%d-%m-%Y %H:%M:%S",
-                        "%d-%b-%Y",
-                        "%d-%m-%Y",
-                        "%Y-%m-%d %H:%M:%S",
-                        "%Y-%m-%d",
-                    ):
-                        try:
-                            parsed = datetime.strptime(
-                                str(published_at).strip(), fmt
-                            ).replace(tzinfo=timezone.utc).timestamp()
-                            break
-                        except ValueError:
-                            pass
-                    published_at = parsed
-
-                self._store_article(
-                    symbol,
-                    title,
-                    summary,
-                    "NSE",
-                    published_at=published_at,
-                    require_timestamp=False,
-                )
-
-            log.info("NSE news refresh completed for %d candidates.", len(symbols))
-        except Exception as exc:
-            log.warning("NSE news refresh failed: %s", exc)
-
-    def _fetch_yfinance(self, symbols):
-        """
-        Secondary broad-news source. yfinance exposes Tickers.news(), which
-        lets us submit the candidate universe as one batch abstraction rather
-        than manually creating 30 individual news calls.
-        """
-        if not symbols:
-            return
-
-        try:
-            tickers = " ".join(f"{self._clean_symbol(s)}.NS" for s in symbols)
-            yf_tickers = yf.Tickers(tickers)
-            batch_news = yf_tickers.news()
-
-            if not isinstance(batch_news, dict):
-                return
-
-            symbol_set = {self._clean_symbol(s) for s in symbols}
-
-            for ticker_key, articles in batch_news.items():
-                symbol = self._clean_symbol(ticker_key)
-                if symbol not in symbol_set:
-                    continue
-
-                if isinstance(articles, dict):
-                    articles = articles.get("news", [])
-                if not isinstance(articles, list):
-                    continue
-
-                for article in articles:
-                    if not isinstance(article, dict):
-                        continue
-
-                    title = article.get("title") or ""
-                    summary = article.get("summary") or ""
-                    publisher = article.get("publisher") or "Yahoo"
-
-                    self._store_article(
-                        symbol,
-                        title,
-                        summary,
-                        publisher,
-                        published_at=article.get("providerPublishTime"),
-                        require_timestamp=True,
-                    )
-
-            log.info(
-                "yfinance news refresh completed for %d candidates.",
-                len(symbols),
-            )
-        except Exception as exc:
-            log.warning("yfinance news refresh failed: %s", exc)
-
-    def refresh(self, symbols, force=False):
-        symbols = list(dict.fromkeys(self._clean_symbol(s) for s in symbols if s))
-        if not symbols:
-            return
-
-        now = time.time()
-        with self.lock:
-            if self.refresh_in_progress:
-                return
-            if not force and now - self.last_refresh < self.NEWS_TTL_SECONDS:
-                return
-            self.refresh_in_progress = True
-            self.last_refresh = now
-
-        try:
-            # Clear only statuses for this candidate universe. This prevents
-            # an old positive headline from surviving forever.
-            with self.lock:
-                for symbol in symbols:
-                    self.cache[symbol] = {
-                        "status": "none",
-                        "title": "",
-                        "source": "",
-                        "updated_at": now,
-                    }
-
-            self._fetch_nse(symbols)
-            self._fetch_yfinance(symbols)
-        finally:
-            with self.lock:
-                self.refresh_in_progress = False
-
-    def refresh_async(self, symbols, force=False):
-        worker = threading.Thread(
-            target=self.refresh,
-            args=(list(symbols), force),
-            daemon=True,
-            name="free-news-refresh",
-        )
-        worker.start()
-
-    def get(self, symbol):
-        symbol = self._clean_symbol(symbol)
-        with self.lock:
-            item = dict(self.cache.get(symbol, {}))
-
-        if not item:
-            return {
-                "news_status": "none",
-                "news_title": "",
-                "news_source": "",
-            }
-
-        # If the cache is stale, don't show an old directional signal.
-        if time.time() - float(item.get("updated_at", 0)) > self.NEWS_WINDOW_SECONDS:
-            return {
-                "news_status": "none",
-                "news_title": "",
-                "news_source": "",
-            }
-
-        return {
-            "news_status": item.get("status", "none"),
-            "news_title": item.get("title", ""),
-            "news_source": item.get("source", ""),
-        }
-
-    def enrich(self, signals):
-        for signal in signals:
-            signal.update(self.get(signal.get("symbol", "")))
-        return signals
-
-dashboard = MobileDashboard(session_name="Mainboard IPO Momentum Matrix")
 
 class NSEHighPerformanceTradingPipeline:
 
-    def __init__(self, broker, instrument_master, config_path="data/trades_config.json", strategy_conf_path="data/conf.json", portfolio_tracker=None, mobile_dashboard=None):
+    def __init__(self, broker, instrument_master, config_path="data/trades_config.json", strategy_conf_path="data/conf.json", portfolio_tracker=None):
         self.broker = broker
         self.master = instrument_master
         self.config_path = Path(config_path)
         self.strategy_conf_path = Path(strategy_conf_path)
         self.bar_aggregators = {}
         self.portfolio_tracker = portfolio_tracker
-        self.mobile_dashboard = MobileDashboard(session_name="Live Production Stream")
-        # Local UI only for now. Telegram dispatch remains disabled until explicitly re-enabled.
-        self.local_ui_only = True
         self.live_cache = {}
         self.tick_queue = queue.Queue()
         self.sws = None
@@ -412,11 +40,6 @@ class NSEHighPerformanceTradingPipeline:
         # UI bridge: populated from the same live calculations used by the scanner.
         # This is presentation state only; it does not alter qualification logic.
         self.ui_state = {}
-        self.swing_stocks_token = os.getenv("SWING_STOCKS_TOKEN", "")
-        self.btst_stocks_token = os.getenv("BTST_STOCKS_TOKEN", "")
-        self.chat_ids = os.getenv("TELEGRAM_CHAT_IDS", "").split(",") if os.getenv("TELEGRAM_CHAT_IDS") else []
-        # Free news layer: refreshed only for the current top candidates.
-        self.news_manager = FreeNewsManager()
         # 1. LOAD THE SCRIP MASTER FIRST SO TOKENS EXIST IN MEMORY
         self.load_raw_scrip_master()
 
@@ -1856,46 +1479,14 @@ class NSEHighPerformanceTradingPipeline:
 
 
     def run_continuous_funnel_loop(self):
-        """
-        Compares NSE historical preparation data with live Angel One data.
-
-        Historical NSE:
-            - liquidity baseline
-            - recent highs/lows
-            - compression
-            - range baseline
-            - historical price structure
-
-        Live Angel One:
-            - LTP vs resistance
-            - intraday range / close-position strength
-            - volume pace (RVOL)
-            - trade pace
-            - turnover
-            - buying pressure
-            - buy quantity / buy orders
-            - breakout persistence
-
-        Telegram receives only WATCH / BUY CANDIDATE / HOLD style signals.
-        """
-
-        log.info(
-            "Continuous live breakout confirmation loop online."
-        )
-
-        accumulated_signals = []
-        accumulated_btst_signals = []
-        last_dispatch_time = time.time()
+        """Evaluate each subscribed tick and publish the current state to the web UI."""
+        log.info("Continuous live breakout confirmation loop online.")
 
         while True:
             try:
-                # Process the first available tick, then immediately drain all
-                # ticks already waiting in the queue.  This keeps every subscribed
-                # stock moving through the existing Angel One -> analysis pipeline
-                # without introducing an artificial 1-minute processing wait.
-                msg = self.tick_queue.get(timeout=1)
-
-                pending_messages = [msg]
+                # Drain queued ticks in batches so every subscribed symbol is
+                # evaluated promptly without waiting for a periodic dispatch.
+                pending_messages = [self.tick_queue.get(timeout=1)]
                 while True:
                     try:
                         pending_messages.append(self.tick_queue.get_nowait())
@@ -1905,13 +1496,11 @@ class NSEHighPerformanceTradingPipeline:
                 for msg in pending_messages:
                     token = str(msg.get("token"))
                     cache = self.live_cache.get(token)
-
                     if not cache:
                         continue
 
                     symbol = cache.get("symbol", "")
                     cs = self.analyze_tick_metrics(token, msg)
-
                     if cs.get("ltp", 0) <= 0:
                         continue
 
@@ -1919,209 +1508,16 @@ class NSEHighPerformanceTradingPipeline:
                     if not past_data:
                         continue
 
-                    signal = self.evaluate_live_breakout(
-                        symbol,
-                        past_data,
-                        cs
-                    )
-
-                    btst_signal = self.evaluate_btst_candidate(
-                        symbol,
-                        past_data,
-                        cs
-                    )
-
-                    # Mirror the already-computed live state to the web UI on
-                    # every processed Angel One tick.  No qualification condition
-                    # is changed here.
+                    signal = self.evaluate_live_breakout(symbol, past_data, cs)
+                    btst_signal = self.evaluate_btst_candidate(symbol, past_data, cs)
                     self._update_ui_state(
                         symbol, token, cs, signal, btst_signal, past_data
                     )
 
-                    if btst_signal:
-                        existing_btst = next(
-                            (
-                                item for item in accumulated_btst_signals
-                                if item["symbol"] == symbol
-                            ),
-                            None
-                        )
-                        # Mobile/Telegram BTST display filter:
-                        # keep only stocks with buy pressure > 40% and
-                        # current gain < 3%.  Do this before the top-30
-                        # collection so non-matching stocks are skipped.
-                        btst_buy_pressure = float(btst_signal.get("buy", 0) or 0)
-                        btst_gain = float(btst_signal.get("gain", 0) or 0)
-
-                        if btst_buy_pressure > 30.0 and btst_gain < 5.0:
-                            if (
-                                existing_btst is None
-                                or btst_signal["score"] > existing_btst["score"]
-                            ):
-                                if existing_btst is not None:
-                                    accumulated_btst_signals.remove(existing_btst)
-                                accumulated_btst_signals.append(btst_signal)
-
-                    if signal:
-                        # Keep the strongest/current signal for the
-                        # symbol during this 20-second batch.
-                        existing = next(
-                            (
-                                item for item in accumulated_signals
-                                if item["symbol"] == symbol
-                            ),
-                            None
-                        )
-
-                        # Mobile/Telegram LIVE display filter:
-                        # keep only stocks with buy pressure > 40% and
-                        # current gain < 3%. Apply before top-30 collection.
-                        live_buy_pressure = float(signal.get("buy", 0) or 0)
-                        live_gain = float(signal.get("gain", 0) or 0)
-
-                        if live_buy_pressure > 30.0 and live_gain < 5.0:
-                            if (
-                                existing is None
-                                or signal["score"] > existing["score"]
-                            ):
-                                if existing is not None:
-                                    accumulated_signals.remove(existing)
-
-                                accumulated_signals.append(signal)
-
-                # ========================================================
-                # DISPATCH EVERY 20 SECONDS
-                # ========================================================
-
-                current_time = time.time()
-
-                if current_time - last_dispatch_time >= 20.0:
-
-                    if accumulated_signals:
-                        # News is deliberately outside the technical scoring engine.
-                        # Refresh asynchronously so the live tick loop is never
-                        # blocked by NSE/Yahoo network calls.
-                        news_symbols = [s.get("symbol") for s in accumulated_signals[:30]]
-                        self.news_manager.refresh_async(news_symbols)
-                        self.news_manager.enrich(accumulated_signals[:30])
-
-                    if (not self.local_ui_only) and accumulated_signals and self.mobile_dashboard:
-                        accumulated_signals.sort(
-                            key=lambda x: (
-                                x["score"],
-                                x["gain"]
-                            ),
-                            reverse=True
-                        )
-
-                        log.info(
-                            f"Dispatching {len(accumulated_signals)} "
-                            "live breakout signals to Telegram..."
-                        )
-
-                        threading.Thread(
-                            target=self.mobile_dashboard.render_and_stream_tables,
-                            args=(
-                                self.swing_stocks_token,
-                                self.chat_ids
-                            ),
-                            kwargs={
-                                "final_top_10": accumulated_signals[:30]
-                            },
-                            daemon=True
-                        ).start()
-
-                    if (not self.local_ui_only) and accumulated_btst_signals and self.mobile_dashboard and self.btst_stocks_token:
-                        accumulated_btst_signals.sort(
-                            key=lambda x: x["score"],
-                            reverse=True
-                        )
-                        log.info(
-                            f"Dispatching {len(accumulated_btst_signals)} BTST candidates to Telegram..."
-                        )
-                        threading.Thread(
-                            target=self.mobile_dashboard.render_and_stream_tables,
-                            args=(
-                                self.btst_stocks_token,
-                                self.chat_ids
-                            ),
-                            kwargs={
-                                "final_top_10": accumulated_btst_signals[:30],
-                                "mode": "btst",
-                            },
-                            daemon=True
-                        ).start()
-
-                    accumulated_signals.clear()
-                    accumulated_btst_signals.clear()
-                    last_dispatch_time = current_time
-
             except queue.Empty:
-                # No tick arrived within one second. Still maintain the
-                # 60-second dispatch clock.
                 log.debug("No ticker received within the 1-second queue wait.")
-                current_time = time.time()
-
-                if current_time - last_dispatch_time >= 20.0:
-                    if accumulated_signals:
-                        news_symbols = [s.get("symbol") for s in accumulated_signals[:30]]
-                        self.news_manager.refresh_async(news_symbols)
-                        self.news_manager.enrich(accumulated_signals[:30])
-
-                    if (not self.local_ui_only) and accumulated_signals and self.mobile_dashboard:
-                        accumulated_signals.sort(
-                            key=lambda x: (
-                                x["score"],
-                                x["gain"]
-                            ),
-                            reverse=True
-                        )
-
-                        threading.Thread(
-                            target=self.mobile_dashboard.render_and_stream_tables,
-                            args=(
-                                self.swing_stocks_token,
-                                self.chat_ids
-                            ),
-                            kwargs={
-                                "final_top_10": accumulated_signals[:30]
-                            },
-                            daemon=True
-                        ).start()
-
-                    if (not self.local_ui_only) and accumulated_btst_signals and self.mobile_dashboard and self.btst_stocks_token:
-                        accumulated_btst_signals.sort(
-                            key=lambda x: x["score"],
-                            reverse=True
-                        )
-                        log.info(
-                            f"Dispatching {len(accumulated_btst_signals)} BTST candidates to Telegram..."
-                        )
-                        threading.Thread(
-                            target=self.mobile_dashboard.render_and_stream_tables,
-                            args=(
-                                self.btst_stocks_token,
-                                self.chat_ids
-                            ),
-                            kwargs={
-                                "final_top_10": accumulated_btst_signals[:30],
-                                "mode": "btst",
-                            },
-                            daemon=True
-                        ).start()
-
-                    accumulated_signals.clear()
-                    accumulated_btst_signals.clear()
-                    last_dispatch_time = current_time
-
-                continue
-
-            except Exception as e:
-                error_trace = traceback.format_exc()
-                log.error(
-                    "Error inside run_continuous_funnel_loop: "
-                    f"{e} {error_trace}"
-                )
+            except Exception:
+                log.exception("Error inside run_continuous_funnel_loop")
 
     def _update_ui_state(self, symbol, token, cs, signal, btst_signal, past_data):
         """Publish scanner state for the web dashboard without changing strategy logic."""
@@ -3377,4 +2773,3 @@ class NSEHighPerformanceTradingPipeline:
                 4
             ),
         }
-

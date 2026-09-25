@@ -237,9 +237,6 @@ def build_snapshot(engine):
             "signal_channel": active_channel,
             "recommendation": recommendation,
             "status": status,
-            "news_status": active.get("news_status", "none"),
-            "news_title": active.get("news_title", ""),
-            "news_source": active.get("news_source", ""),
             "price_history": price_history,
             "volume_history": volume_history,
             "today_price_history": today_price_history,
@@ -311,14 +308,14 @@ def build_snapshot(engine):
                 "buy": item.get("buying_pressure", 0) * 100,
             })
 
-    swing_top30 = sorted(swing_candidates, key=lambda x: x["score"], reverse=True)[:30]
-    btst_top30 = sorted(btst_candidates, key=lambda x: x["score"], reverse=True)[:30]
+    swing_top30 = sorted(swing_candidates, key=lambda x: x["score"], reverse=True)[:80]
+    btst_top30 = sorted(btst_candidates, key=lambda x: x["score"], reverse=True)[:80]
 
     stocks = sorted(
         stocks_by_symbol.values(),
         key=lambda x: x.get("rating", 0),
         reverse=True,
-    )[:30]
+    )[:80]
     return {
         "updated_at": time.time(),
         "stocks": stocks,

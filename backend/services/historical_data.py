@@ -1,4 +1,4 @@
 # Historical data entry point.
-# The supplied nse engine still owns the production NSE/yfinance workflow.
+# The supplied NSE engine owns the production historical-data workflow.
 def get_engine_historical(engine):
     return getattr(engine, "volume_shockers", {})

@@ -22,7 +22,7 @@ class AppState:
         self.ui_sent_stock_details = {}
         self._ui_log_started_at = time.monotonic()
         self._ui_log_started_wall = datetime.now()
-        self._ui_log_interval = 3600.0
+        self._ui_log_interval = 600.0
 
     def set_engine(self, engine):
         with self.lock:

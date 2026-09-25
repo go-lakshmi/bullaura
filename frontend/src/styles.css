@@ -7,6 +7,11 @@
 
 /* Status hover popup: the popup opens ONLY while the status badge is hovered. */
 .card{position:relative;overflow:visible}
+.cardTop{flex-direction:column;align-items:flex-start;gap:2px}
+.cardTop > div:first-child{max-width:calc(100% - 72px);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cardTop > div:last-child{display:flex;align-items:center;justify-content:space-between;width:100%;margin:12px 0 0;text-align:left}
+.cardTop b{font-size:12px;color:#f97316}
+.cardTop em{font-size:12px;font-weight:700}
 .common-status{position:absolute;top:8px;right:8px;z-index:30;display:flex;align-items:center;gap:4px;padding:4px 8px;border-radius:999px;font-size:11px;font-weight:700;background:#fff;border:1px solid #e5e7eb;box-shadow:0 1px 3px rgba(0,0,0,.08);cursor:default;white-space:nowrap}
 .status-buy{color:#047857;border-color:#86efac;background:#f0fdf4}
 .status-break{color:#1d4ed8;border-color:#93c5fd;background:#eff6ff}
