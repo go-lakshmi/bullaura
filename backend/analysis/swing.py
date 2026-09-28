@@ -1,4 +1,3 @@
-# Swing qualification facade. The supplied engine remains the source of truth.
+# Compatibility facade; Swing and BTST now share the unified rating filter.
 def evaluate(engine, symbol, past_data, live_metrics):
-    evaluator = getattr(engine, "evaluate_live_breakout", None)
-    return evaluator(symbol, past_data, live_metrics) if evaluator else None
+    return engine.evaluate_unified_candidate(symbol, past_data, live_metrics)

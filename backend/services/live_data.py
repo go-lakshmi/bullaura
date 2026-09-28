@@ -10,32 +10,6 @@ def _num(value, default=0.0):
         return float(default)
 
 
-def _category(signal, fallback="WAIT"):
-    """Normalize Swing/BTST recommendations to the common UI categories."""
-    if not signal:
-        return fallback
-    recommendation = str(signal.get("recommendation", "") or "").strip().upper()
-
-    if recommendation == "BUY" or recommendation == "BTST CANDIDATE":
-        return "BUY"
-    if recommendation == "WAIT" or recommendation == "BTST EARLY":
-        return "WAIT"
-    if recommendation in {"BREAK", "BREAKOUT"}:
-        return "BREAK"
-    if recommendation in {"WATCH", "BTST WATCH"}:
-        # Swing's WATCH can represent an already reached breakout.
-        # Preserve that distinction as BREAK; otherwise it remains WATCH.
-        if bool(signal.get("breakout_persistent")):
-            return "BREAK"
-        if _num(signal.get("distance"), 999.0) <= 0:
-            return "BREAK"
-        return "WATCH"
-
-    # If the engine ever supplies an unfamiliar BTST label, let the Swing
-    # category for the same symbol provide the stable four-state category.
-    return fallback
-
-
 def build_snapshot(engine):
     """
     Build the local-UI snapshot.
@@ -54,8 +28,7 @@ def build_snapshot(engine):
             continue
 
         cs = cache.get("ui_last_cs") or {}
-        live_signal = cache.get("ui_live_signal") or {}
-        btst_signal = cache.get("ui_btst_signal") or {}
+        signal = cache.get("ui_unified_signal") or {}
         past = getattr(engine, "volume_shockers", {}).get(symbol, {}) or {}
 
         # ---------------------------------------------------------------
@@ -183,58 +156,50 @@ def build_snapshot(engine):
 
         intraday_live = bool(today_price_history and current_ltp > 0)
 
-        # Local UI receives only the same display-qualified candidates intended
-        # for the mobile dashboard: buy pressure > 40% and gain < 3%.
-        # Keep BTST and Swing as separate channel states so the UI never makes
-        # one channel look like the other. Then choose the strongest channel
-        # only for the primary card badge/ranking.
-        def display_qualified(candidate):
-            if not candidate:
-                return False
-            return (
-                _num(candidate.get("gain")) < 3.0
-            )
-
-        btst_display = btst_signal if display_qualified(btst_signal) else {}
-        swing_display = live_signal if display_qualified(live_signal) else {}
-        qualifying = [c for c in (btst_display, swing_display) if c]
-
-        if not qualifying:
+        if not signal:
             continue
 
-        active = max(qualifying, key=lambda x: _num(x.get("score")))
-        recommendation = active.get("recommendation", "")
-        status = active.get("status", "")
-        active_channel = (
-            "BTST" if active is btst_display else "SWING"
-        )
-        if btst_display and swing_display:
-            active_channel = "BTST+SWING"
+        recommendation = str(signal.get("recommendation", "WAIT") or "WAIT")
+        rating = _num(signal.get("rating", signal.get("score")))
+        gain_pct = _num(cs.get("gain_pct"))
 
-        day5 = past.get("day_5", {}) or {}
-        day10 = past.get("day_10", {}) or {}
-        day20 = past.get("day_20", {}) or {}
+        # Presentation-only rule: keep sharp intraday gainers off the UI.
+        # This runs before ranking so excluded cards do not consume a top-100 slot.
+        if gain_pct > 3.0:
+            continue
+
+        live_ltp = _num(cs.get("ltp"))
+        day_low = _num(cs.get("day_low"))
+        distance_from_day_low_pct = (
+            (live_ltp - day_low) / day_low * 100.0
+            if day_low > 0
+            else None
+        )
+
+        # Hide stocks trading less than 0.5% above today's low. This affects
+        # only the UI snapshot; tick processing and rating continue normally.
+        if (
+            distance_from_day_low_pct is not None
+            and distance_from_day_low_pct < 0.5
+        ):
+            continue
+
+        signal_age = max(0.0, time.time() - _num(cache.get("ui_updated_at"), time.time()))
+        data_stale = signal_age > 120.0
+        if data_stale:
+            rating = max(0.0, rating - 15.0)
+            recommendation = "WAIT"
+        status = "🔴 WAIT" if data_stale else str(signal.get("status", recommendation) or recommendation)
 
         stock_payload = {
             "symbol": symbol,
             "token": str(token),
             "ltp": current_ltp,
-            "gain": _num(cs.get("gain_pct")),
-            "rvol": _num(active.get("vol")),
+            "gain": gain_pct,
+            "rvol": _num(signal.get("vol")),
             "buying_pressure": _num(cs.get("buying_pressure"), 0.5),
-            "rating": _num(active.get("score"), _num(past.get("preparation_score"))),
-            "btst_signal": btst_display.get("recommendation", ""),
-            "swing_signal": swing_display.get("recommendation", ""),
-            "btst_score": _num(btst_display.get("score")),
-            "swing_score": _num(swing_display.get("score")),
-            "btst_category": _category(
-                btst_display, _category(swing_display, "")
-            ),
-            "swing_category": _category(swing_display, ""),
-            "category": (
-                _category(btst_display, _category(swing_display, "WAIT"))
-            ),
-            "signal_channel": active_channel,
+            "rating": rating,
+            "category": recommendation,
             "recommendation": recommendation,
             "status": status,
             "price_history": price_history,
@@ -261,17 +226,23 @@ def build_snapshot(engine):
                 "day_high": _num(cs.get("day_high")),
                 "day_low": _num(cs.get("day_low")),
                 "previous_close": _num(cs.get("last_closed_price")),
-                "resistance": _num(active.get("resistance")),
-                "distance_to_resistance": _num(active.get("distance"), 999),
-                "price_stable": bool(active.get("price_stable", False)),
-                "price_rising_60s": bool(active.get("price_rising_60s", False)),
-                "price_rising_180s": bool(active.get("price_rising_180s", False)),
-                "higher_low": bool(active.get("higher_low", False)),
-                "recovery": bool(active.get("recovery", False)),
-                "compression": bool(active.get("compression", False)),
-                "pressure_rising": bool(active.get("pressure_rising", False)),
-                "pattern": active.get("pattern", past.get("setup", "")),
-                "reason": active.get("reason", ""),
+                "price_stable": bool(signal.get("price_stable", False)),
+                "price_rising_60s": bool(signal.get("price_rising_60s", False)),
+                "price_rising_180s": bool(signal.get("price_rising_180s", False)),
+                "higher_low": bool(signal.get("higher_low", False)),
+                "no_new_low": signal.get("no_new_low"),
+                "pressure_rising": bool(signal.get("pressure_rising", False)),
+                "historical_month_change": _num(signal.get("historical_month_change")),
+                "historical_5d_change": _num(signal.get("historical_5d_change")),
+                "settled_days": int(_num(signal.get("settled_days"))),
+                "price_change_5m": _num(signal.get("price_change_5m")),
+                "price_change_15m": _num(signal.get("price_change_15m")),
+                "volume_ratio": _num(signal.get("vol")),
+                "volume_baseline": signal.get("volume_baseline", "unavailable"),
+                "volume_baseline_days": int(_num(signal.get("volume_baseline_days"))),
+                "expected_volume": int(_num(signal.get("expected_volume"))),
+                "data_stale": data_stale,
+                "data_age_seconds": round(signal_age, 1),
             },
             "historical": past,
             "updated_at": _num(cache.get("ui_updated_at")),
@@ -283,42 +254,12 @@ def build_snapshot(engine):
         if existing is None or stock_payload["rating"] > existing["rating"]:
             stocks_by_symbol[symbol] = stock_payload
 
-    # Keep independent top-30 lists for the two engines. The UI can stay
-    # neutral, while downstream consumers still have the full Swing and BTST
-    # ranking context.
-    swing_candidates = []
-    btst_candidates = []
-    for item in stocks_by_symbol.values():
-        if item.get("swing_category"):
-            swing_candidates.append({
-                "symbol": item["symbol"],
-                "score": item.get("swing_score", 0),
-                "category": item["swing_category"],
-                "ltp": item.get("ltp", 0),
-                "gain": item.get("gain", 0),
-                "buy": item.get("buying_pressure", 0) * 100,
-            })
-        if item.get("btst_category"):
-            btst_candidates.append({
-                "symbol": item["symbol"],
-                "score": item.get("btst_score", 0),
-                "category": item["btst_category"],
-                "ltp": item.get("ltp", 0),
-                "gain": item.get("gain", 0),
-                "buy": item.get("buying_pressure", 0) * 100,
-            })
-
-    swing_top30 = sorted(swing_candidates, key=lambda x: x["score"], reverse=True)[:80]
-    btst_top30 = sorted(btst_candidates, key=lambda x: x["score"], reverse=True)[:80]
-
     stocks = sorted(
         stocks_by_symbol.values(),
         key=lambda x: x.get("rating", 0),
         reverse=True,
-    )[:80]
+    )[:100]
     return {
         "updated_at": time.time(),
         "stocks": stocks,
-        "swing_top30": swing_top30,
-        "btst_top30": btst_top30,
     }

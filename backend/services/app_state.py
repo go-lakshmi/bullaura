@@ -37,7 +37,6 @@ class AppState:
             "symbol": symbol,
             "token": stock.get("token", ""),
             "category": stock.get("category", ""),
-            "signal_channel": stock.get("signal_channel", ""),
             "recommendation": stock.get("recommendation", ""),
             "status": stock.get("status", ""),
             "score": stock.get("rating", stock.get("score", 0)),
@@ -55,21 +54,16 @@ class AppState:
             "close_position": metrics.get("close_position", 0),
             "day_high": metrics.get("day_high", 0),
             "day_low": metrics.get("day_low", 0),
-            "resistance": metrics.get("resistance", 0),
-            "distance_to_resistance": metrics.get("distance_to_resistance", 999),
             "price_stable": metrics.get("price_stable", False),
             "price_rising_60s": metrics.get("price_rising_60s", False),
             "price_rising_180s": metrics.get("price_rising_180s", False),
             "higher_low": metrics.get("higher_low", False),
-            "recovery": metrics.get("recovery", False),
-            "compression": metrics.get("compression", False),
             "pressure_rising": metrics.get("pressure_rising", False),
-            "pattern": metrics.get("pattern", ""),
-            "reason": metrics.get("reason", ""),
-            "btst_signal": stock.get("btst_signal", ""),
-            "swing_signal": stock.get("swing_signal", ""),
-            "btst_score": stock.get("btst_score", 0),
-            "swing_score": stock.get("swing_score", 0),
+            "no_new_low": metrics.get("no_new_low"),
+            "volume_baseline": metrics.get("volume_baseline", ""),
+            "volume_baseline_days": metrics.get("volume_baseline_days", 0),
+            "historical_month_change": metrics.get("historical_month_change", 0),
+            "data_stale": metrics.get("data_stale", False),
         }
 
     def _collect_ui_stocks_locked(self, snapshot):
@@ -124,17 +118,16 @@ class AppState:
 
         for rank, stock in enumerate(stocks, start=1):
             log.info(
-                "UI SEND STOCK #%d | symbol=%s | token=%s | category=%s | channel=%s | "
-                "recommendation=%s | status=%s | score=%s | LTP=%.2f | gain=%.2f%% | "
+                "UI SEND STOCK #%d | symbol=%s | token=%s | category=%s | "
+                "recommendation=%s | status=%s | rating=%s | LTP=%.2f | gain=%.2f%% | "
                 "RVOL=%.2fx | buy_pressure=%.2f%% | current_volume=%s | avg5=%s | avg20=%s | "
                 "buy_qty=%s | sell_qty=%s | buy_orders=%s | sell_orders=%s | close_pos=%.2f%% | "
-                "high=%.2f | low=%.2f | resistance=%.2f | dist_resistance=%.2f%% | "
-                "stable=%s | rise60=%s | rise180=%s | higher_low=%s | recovery=%s | "
-                "compression=%s | pressure_rising=%s | pattern=%s | reason=%s | "
-                "BTST=%s/%s | SWING=%s/%s",
+                "high=%.2f | low=%.2f | stable=%s | rise60=%s | rise180=%s | "
+                "higher_low=%s | no_new_low=%s | pressure_rising=%s | month_change=%.2f%% | "
+                "volume_baseline=%s/%s | stale=%s",
                 rank,
                 stock.get("symbol", ""), stock.get("token", ""),
-                stock.get("category", ""), stock.get("signal_channel", ""),
+                stock.get("category", ""),
                 stock.get("recommendation", ""), stock.get("status", ""),
                 stock.get("score", 0), float(stock.get("ltp", 0) or 0),
                 float(stock.get("gain_pct", 0) or 0), float(stock.get("rvol", 0) or 0),
@@ -144,13 +137,12 @@ class AppState:
                 stock.get("buy_orders", 0), stock.get("sell_orders", 0),
                 float(stock.get("close_position", 0) or 0),
                 float(stock.get("day_high", 0) or 0), float(stock.get("day_low", 0) or 0),
-                float(stock.get("resistance", 0) or 0), float(stock.get("distance_to_resistance", 999) or 999),
                 stock.get("price_stable", False), stock.get("price_rising_60s", False),
                 stock.get("price_rising_180s", False), stock.get("higher_low", False),
-                stock.get("recovery", False), stock.get("compression", False),
-                stock.get("pressure_rising", False), stock.get("pattern", ""),
-                stock.get("reason", ""), stock.get("btst_signal", ""), stock.get("btst_score", 0),
-                stock.get("swing_signal", ""), stock.get("swing_score", 0),
+                stock.get("no_new_low"), stock.get("pressure_rising", False),
+                float(stock.get("historical_month_change", 0) or 0),
+                stock.get("volume_baseline", ""), stock.get("volume_baseline_days", 0),
+                stock.get("data_stale", False),
             )
 
         log.info("UI HOURLY SEND SUMMARY END | unique_stocks=%d | collection cleared", len(stocks))

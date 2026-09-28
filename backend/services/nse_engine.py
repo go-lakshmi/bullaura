@@ -32,11 +32,23 @@ class NSEHighPerformanceTradingPipeline:
         self.portfolio_tracker = portfolio_tracker
         self.live_cache = {}
         self.tick_queue = queue.Queue()
+        self.tick_stats_lock = threading.Lock()
+        self.tick_stats = {
+            "received": 0,
+            "evaluated": 0,
+            "skipped": 0,
+            "failed": 0,
+        }
+        self.tick_stats_by_token = {}
+        self.tick_unmapped_symbols = []
         self.sws = None
         self.active_stream_tokens = set()  
         self.settings = {}
         self.scrip_master_data = None
         self.volume_shockers = {}
+        self.volume_profile_path = Path("data/intraday_volume_profiles.json")
+        self.intraday_volume_profiles = self._load_intraday_volume_profiles()
+        self._volume_profile_last_save = 0.0
         # UI bridge: populated from the same live calculations used by the scanner.
         # This is presentation state only; it does not alter qualification logic.
         self.ui_state = {}
@@ -68,32 +80,15 @@ class NSEHighPerformanceTradingPipeline:
 
     def download_stockdata_from_nse(self, symbols):
         """
-        Download NSE 1-month data and apply the existing NSE filters.
-
-        Existing filters are NOT changed:
-
-        1. Need at least 22 valid NSE EQ sessions.
-        2. Average trades over latest 20 sessions >= 2000.
-        3. Older D18-D21 price structure must satisfy:
-            - strict historical pattern
-            OR
-            - max older price within 1% of recent max
-        for either D0-D10 or D0-D15.
-        4. Average DailyMovePct of latest 5 sessions must be < 1%.
-
-        Added:
-        - Detailed rejection logging.
-        - Aggregate rejection counters.
-        - Successful-stock logging.
-        - Cache version bumped to v4 to invalidate old empty v3 cache.
+        Download one year of NSE history and select candidates using the
+        52-week position, liquidity, and recent 22-session price patterns.
         """
 
         cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
 
-        # IMPORTANT:
-        # v4 forces today's old v3 cache to be ignored.
-        cache_version = "nse_live_volume_shocker_v4"
+        # v6 invalidates the old 45-day cache without the 52-week cutoff.
+        cache_version = "nse_live_volume_shocker_v6"
 
         # ------------------------------------------------------------------
         # CACHE
@@ -148,7 +143,7 @@ class NSEHighPerformanceTradingPipeline:
         )
 
         print(
-            f"Downloading 1-month historical data for "
+            f"Downloading 1-year historical data for "
             f"{len(symbols)} NSE stocks..."
         )
 
@@ -163,9 +158,10 @@ class NSEHighPerformanceTradingPipeline:
             "invalid_price_rows": 0,
             "less_than_20_trade_rows": 0,
             "low_average_trades": 0,
-            "price_structure_failed": 0,
-            "less_than_5_daily_moves": 0,
-            "average_daily_move_failed": 0,
+            "invalid_52week_range": 0,
+            "low_52week_position": 0,
+            "historical_pattern_failed": 0,
+            "recent_cooling_failed": 0,
             "api_or_processing_error": 0,
             "passed": 0,
         }
@@ -190,7 +186,8 @@ class NSEHighPerformanceTradingPipeline:
                 # ----------------------------------------------------------
 
                 to_date = datetime.now()
-                from_date = to_date - timedelta(days=45)
+                # Include a small calendar buffer for weekends and holidays.
+                from_date = to_date - timedelta(days=370)
 
                 df = capital_market.price_volume_data(
                     symbol=symbol,
@@ -232,6 +229,17 @@ class NSEHighPerformanceTradingPipeline:
                         ascending=False,
                     )
 
+                    # NSE may return today's still-forming session. Only
+                    # completed sessions can participate in historical rules.
+                    market_today = datetime.now(
+                        ZoneInfo("Asia/Kolkata")
+                    ).date()
+                    year_ago = market_today - timedelta(days=365)
+                    df = df[
+                        (df["Date"].dt.date < market_today)
+                        & (df["Date"].dt.date >= year_ago)
+                    ].copy()
+
                 # ----------------------------------------------------------
                 # EQ SERIES
                 # ----------------------------------------------------------
@@ -269,17 +277,14 @@ class NSEHighPerformanceTradingPipeline:
                     return symbol, None
 
                 # ----------------------------------------------------------
-                # KEEP 22 SESSIONS
-                # ----------------------------------------------------------
-
-                df = df.head(22).copy()
-
-                # ----------------------------------------------------------
                 # REQUIRED COLUMNS
                 # ----------------------------------------------------------
 
                 required_cols = [
+                    "Date",
                     "PrevClose",
+                    "HighPrice",
+                    "LowPrice",
                     "ClosePrice",
                     "No.ofTrades",
                 ]
@@ -354,6 +359,8 @@ class NSEHighPerformanceTradingPipeline:
                 df = df.dropna(
                     subset=[
                         "PrevClose",
+                        "HighPrice",
+                        "LowPrice",
                         "ClosePrice",
                     ]
                 ).copy()
@@ -373,268 +380,70 @@ class NSEHighPerformanceTradingPipeline:
 
                     return symbol, None
 
-                # ==========================================================
-                # FILTER 1
-                # AVERAGE TRADES
-                # ==========================================================
-
-                trades_20d = (
-                    df["No.ofTrades"]
-                    .head(20)
-                    .dropna()
-                )
-
+                # Require a minimum average daily trade count so very
+                # illiquid stocks are excluded from the candidate universe.
+                trades_20d = df["No.ofTrades"].head(20).dropna()
                 if len(trades_20d) < 20:
-
-                    increment_counter(
-                        "less_than_20_trade_rows"
-                    )
-
-                    log.warning(
-                        "NSE REJECT | %s | "
-                        "reason=LESS_THAN_20_TRADE_ROWS | rows=%d",
+                    increment_counter("less_than_20_trade_rows")
+                    log.info(
+                        "NSE REJECT | %s | reason=LESS_THAN_20_TRADE_ROWS | rows=%d",
                         symbol,
                         len(trades_20d),
                     )
-
                     return symbol, None
 
-                avg_trades_20d = float(
-                    trades_20d.mean()
-                )
-
+                avg_trades_20d = float(trades_20d.mean())
                 if avg_trades_20d < 2000:
-
-                    increment_counter(
-                        "low_average_trades"
-                    )
-
+                    increment_counter("low_average_trades")
                     log.info(
-                        "NSE REJECT | %s | "
-                        "reason=LOW_AVERAGE_TRADES | "
+                        "NSE REJECT | %s | reason=LOW_AVERAGE_TRADES | "
                         "avg_trades_20d=%.2f | required>=2000",
                         symbol,
                         avg_trades_20d,
                     )
-
                     return symbol, None
 
-                # ==========================================================
-                # PRICE STRUCTURE
-                # ==========================================================
-
-                close = (
-                    df["ClosePrice"]
-                    .astype(float)
-                    .tolist()
-                )
-
-                # D18-D21
-                older_4 = close[18:22]
-
-                # D0-D10
-                recent_11 = close[0:11]
-
-                # D0-D15
-                recent_16 = close[0:16]
-
-                older_max = (
-                    max(older_4)
-                    if older_4
-                    else 0.0
-                )
-
-                recent_max_11 = (
-                    max(recent_11)
-                    if recent_11
-                    else 0.0
-                )
-
-                recent_max_16 = (
-                    max(recent_16)
-                    if recent_16
-                    else 0.0
-                )
-
                 # ----------------------------------------------------------
-                # Difference between old max and recent max
+                # 52-WEEK POSITION FILTER
                 # ----------------------------------------------------------
 
-                price_difference_11_pct = (
-                    abs(
-                        older_max
-                        - recent_max_11
-                    )
-                    / recent_max_11
-                    * 100.0
-                    if recent_max_11 > 0
-                    else 999.0
-                )
+                week_52_high = float(df["HighPrice"].max())
+                week_52_low = float(df["LowPrice"].min())
+                week_52_range = week_52_high - week_52_low
+                latest_completed_close = float(df.iloc[0]["ClosePrice"])
 
-                price_difference_16_pct = (
-                    abs(
-                        older_max
-                        - recent_max_16
-                    )
-                    / recent_max_16
-                    * 100.0
-                    if recent_max_16 > 0
-                    else 999.0
-                )
-
-                # ----------------------------------------------------------
-                # STRICT FILTER
-                # ----------------------------------------------------------
-
-                strict_filter_11 = all(
-                    old_price > recent_max_11
-                    for old_price in older_4
-                )
-
-                strict_filter_16 = all(
-                    old_price > recent_max_16
-                    for old_price in older_4
-                )
-
-                # ----------------------------------------------------------
-                # FLEXIBLE FILTER
-                # ----------------------------------------------------------
-
-                close_filter_11 = (
-                    price_difference_11_pct <= 1.0
-                )
-
-                close_filter_16 = (
-                    price_difference_16_pct <= 1.0
-                )
-
-                # ----------------------------------------------------------
-                # FINAL PRICE FILTER
-                # ----------------------------------------------------------
-
-                # ----------------------------------------------------------
-                # STABILIZED DECLINE FILTER
-                #
-                # Allow stocks that have declined meaningfully from the older
-                # price zone but have started stabilizing in the recent window.
-                # Existing strict and 1% close filters remain unchanged.
-                # ----------------------------------------------------------
-
-                recent_min_11 = min(recent_11) if recent_11 else 0.0
-                recent_min_16 = min(recent_16) if recent_16 else 0.0
-
-                prior_decline_pct_11 = (
-                    ((older_max - recent_max_11) / older_max) * 100.0
-                    if older_max > 0 else 0.0
-                )
-                prior_decline_pct_16 = (
-                    ((older_max - recent_max_16) / older_max) * 100.0
-                    if older_max > 0 else 0.0
-                )
-
-                recent_range_pct_11 = (
-                    ((recent_max_11 - recent_min_11) / recent_max_11) * 100.0
-                    if recent_max_11 > 0 else 999.0
-                )
-                recent_range_pct_16 = (
-                    ((recent_max_16 - recent_min_16) / recent_max_16) * 100.0
-                    if recent_max_16 > 0 else 999.0
-                )
-
-                recent_3_11 = recent_11[:3]
-                recent_3_16 = recent_16[:3]
-
-                recent_recovery_11 = (
-                    len(recent_3_11) >= 3
-                    and recent_3_11[0] >= recent_3_11[1] * 0.99
-                    and recent_3_11[0] >= recent_3_11[2] * 0.99
-                )
-                recent_recovery_16 = (
-                    len(recent_3_16) >= 3
-                    and recent_3_16[0] >= recent_3_16[1] * 0.99
-                    and recent_3_16[0] >= recent_3_16[2] * 0.99
-                )
-
-                stabilized_decline_11 = (
-                    prior_decline_pct_11 >= 5.0
-                    and recent_range_pct_11 <= 8.0
-                    and recent_recovery_11
-                )
-                stabilized_decline_16 = (
-                    prior_decline_pct_16 >= 5.0
-                    and recent_range_pct_16 <= 8.0
-                    and recent_recovery_16
-                )
-
-                # ----------------------------------------------------------
-                # FINAL PRICE FILTER
-                # ----------------------------------------------------------
-
-                price_filter_11 = (
-                    strict_filter_11
-                    or close_filter_11
-                    or stabilized_decline_11
-                )
-
-                price_filter_16 = (
-                    strict_filter_16
-                    or close_filter_16
-                    or stabilized_decline_16
-                )
-
-                if not (
-                    price_filter_11
-                    or price_filter_16
-                ):
-
-                    increment_counter(
-                        "price_structure_failed"
-                    )
-
+                if week_52_range <= 0 or week_52_low <= 0:
+                    increment_counter("invalid_52week_range")
                     log.info(
-                        "NSE REJECT | %s | "
-                        "reason=PRICE_STRUCTURE_FAILED | "
-                        "older_D18_D21=%s | "
-                        "older_max=%.2f | "
-                        "recent_max_D0_D10=%.2f | "
-                        "recent_max_D0_D15=%.2f | "
-                        "diff_D0_D10=%.2f%% | "
-                        "diff_D0_D15=%.2f%% | "
-                        "strict_D0_D10=%s | "
-                        "strict_D0_D15=%s | "
-                        "close_D0_D10=%s | "
-                        "close_D0_D15=%s | "
-                        "stabilized_D0_D10=%s | "
-                        "stabilized_D0_D15=%s | "
-                        "prior_decline_D0_D10=%.2f%% | "
-                        "prior_decline_D0_D15=%.2f%% | "
-                        "recent_range_D0_D10=%.2f%% | "
-                        "recent_range_D0_D15=%.2f%%",
+                        "NSE REJECT | %s | reason=INVALID_52_WEEK_RANGE | "
+                        "high=%.2f | low=%.2f",
                         symbol,
-                        [round(x, 2) for x in older_4],
-                        older_max,
-                        recent_max_11,
-                        recent_max_16,
-                        price_difference_11_pct,
-                        price_difference_16_pct,
-                        strict_filter_11,
-                        strict_filter_16,
-                        close_filter_11,
-                        close_filter_16,
-                        stabilized_decline_11,
-                        stabilized_decline_16,
-                        prior_decline_pct_11,
-                        prior_decline_pct_16,
-                        recent_range_pct_11,
-                        recent_range_pct_16,
+                        week_52_high,
+                        week_52_low,
                     )
-
                     return symbol, None
 
-                # ==========================================================
-                # FILTER 3
-                # DAILY MOVE
-                # ==========================================================
+                position_52w_pct = (
+                    (latest_completed_close - week_52_low)
+                    / week_52_range
+                    * 100.0
+                )
+                if position_52w_pct < 30.0:
+                    increment_counter("low_52week_position")
+                    log.info(
+                        "NSE REJECT | %s | reason=52_WEEK_POSITION_BELOW_30%% | "
+                        "position=%.2f%% | close=%.2f | low=%.2f | high=%.2f",
+                        symbol,
+                        position_52w_pct,
+                        latest_completed_close,
+                        week_52_low,
+                        week_52_high,
+                    )
+                    return symbol, None
+
+                # Keep the existing short-term filters and NSE payload
+                # limited to the latest 22 completed sessions.
+                df = df.head(22).copy()
 
                 daily_moves = (
                     (
@@ -658,40 +467,9 @@ class NSEHighPerformanceTradingPipeline:
                     .dropna()
                 )
 
-                if len(last_5_moves) < 5:
-
-                    increment_counter(
-                        "less_than_5_daily_moves"
-                    )
-
-                    log.warning(
-                        "NSE REJECT | %s | "
-                        "reason=LESS_THAN_5_DAILY_MOVES | rows=%d",
-                        symbol,
-                        len(last_5_moves),
-                    )
-
-                    return symbol, None
-
                 last_5_avg_move = float(
                     last_5_moves.mean()
-                )
-
-                if last_5_avg_move >= 1.0:
-
-                    increment_counter(
-                        "average_daily_move_failed"
-                    )
-
-                    log.info(
-                        "NSE REJECT | %s | "
-                        "reason=AVERAGE_DAILY_MOVE_GE_1_PERCENT | "
-                        "last_5_avg_move=%.4f%% | required<1.0%%",
-                        symbol,
-                        last_5_avg_move,
-                    )
-
-                    return symbol, None
+                ) if not last_5_moves.empty else 0.0
 
                 # ==========================================================
                 # HISTORICAL BREAKOUT BASELINE
@@ -711,6 +489,11 @@ class NSEHighPerformanceTradingPipeline:
                     in hist20.columns
                     else 0.0
                 )
+                avg_volume_5d = (
+                    float(hist5["TotalTradedQuantity"].mean())
+                    if "TotalTradedQuantity" in hist5.columns
+                    else 0.0
+                )
 
                 avg_turnover_20d = (
                     float(
@@ -723,19 +506,13 @@ class NSEHighPerformanceTradingPipeline:
                     else 0.0
                 )
 
-                avg_trades_20d = float(
-                    hist20[
-                        "No.ofTrades"
-                    ].mean()
-                )
-
                 historical_range_pct = (
                     (
                         df["HighPrice"]
                         - df["LowPrice"]
                     )
                     / df[
-                        "PrevClose"
+                        "LowPrice"
                     ].replace(
                         0,
                         np.nan,
@@ -756,6 +533,134 @@ class NSEHighPerformanceTradingPipeline:
                     .empty
                     else 0.0
                 )
+
+                # ----------------------------------------------------------
+                # HISTORICAL PATTERN: falling from older highs or flat bands
+                # M1=D0-D4, M2=D8-D12, M3=D13-D17, M4=D18-D21.
+                # ----------------------------------------------------------
+
+                window_ranges = {
+                    "M1": df.iloc[0:5],
+                    "M2": df.iloc[8:13],
+                    "M3": df.iloc[13:18],
+                    "M4": df.iloc[18:22],
+                }
+                window_highs = {
+                    name: float(window["HighPrice"].max())
+                    for name, window in window_ranges.items()
+                }
+                window_lows = {
+                    name: float(window["LowPrice"].min())
+                    for name, window in window_ranges.items()
+                }
+
+                m1_high = window_highs["M1"]
+                m2_high = window_highs["M2"]
+                m3_high = window_highs["M3"]
+                m4_high = window_highs["M4"]
+                highs = list(window_highs.values())
+                lows = list(window_lows.values())
+                high_spread_pct = (
+                    (max(highs) - min(highs)) / min(highs) * 100.0
+                    if min(highs) > 0 else float("inf")
+                )
+                low_spread_pct = (
+                    (max(lows) - min(lows)) / min(lows) * 100.0
+                    if min(lows) > 0 else float("inf")
+                )
+                fall_from_m4_pct = (
+                    max(
+                        (
+                            (m4_high - float(df.iloc[day]["HighPrice"]))
+                            / m4_high * 100.0
+                            for day in range(4)
+                        ),
+                        default=0.0,
+                    )
+                    if m4_high > 0 else 0.0
+                )
+                fall_from_m3_pct = (
+                    max(
+                        (
+                            (m3_high - float(df.iloc[day]["HighPrice"]))
+                            / m3_high * 100.0
+                            for day in range(4)
+                        ),
+                        default=0.0,
+                    )
+                    if m3_high > 0 else 0.0
+                )
+                fall_from_m4 = (
+                    any(
+                        (
+                            (m4_high - float(df.iloc[day]["HighPrice"]))
+                            / m4_high * 100.0
+                        ) > 8.0
+                        for day in range(4)
+                    )
+                    and m2_high < m4_high
+                )
+                fall_from_m3 = (
+                    any(
+                        (
+                            (m3_high - float(df.iloc[day]["HighPrice"]))
+                            / m3_high * 100.0
+                        ) > 8.0
+                        for day in range(4)
+                    )
+                    and m2_high < m3_high
+                )
+                high_flat = high_spread_pct <= 1.0
+                low_flat = low_spread_pct <= 1.0
+                historical_selected = (
+                    fall_from_m4 or fall_from_m3 or high_flat or low_flat
+                )
+                historical_patterns = [
+                    label for condition, label in (
+                        (fall_from_m4, "FALL_FROM_M4"),
+                        (fall_from_m3, "FALL_FROM_M3"),
+                        (high_flat, "HIGH_SPREAD_FLAT"),
+                        (low_flat, "LOW_SPREAD_FLAT"),
+                    ) if condition
+                ]
+
+                cooling_threshold_pct = min(2.0, 0.8 * avg_range_20d)
+                recent_day_ranges = (
+                    historical_range_pct.head(3).tolist()
+                )
+                cooling_days = []
+                for value in recent_day_ranges:
+                    if pd.isna(value) or value > cooling_threshold_pct:
+                        break
+                    cooling_days.append(float(value))
+                recent_cooling = bool(cooling_days)
+
+                # TEMPORARY TEST: cooling is calculated and logged, but does
+                # not reject a stock. Restore `or not recent_cooling` after
+                # validating the NSE candidates.
+                if not recent_cooling:
+                    increment_counter("recent_cooling_failed")
+
+                if not historical_selected:
+                    increment_counter("historical_pattern_failed")
+                    log.info(
+                        "NSE REJECT | %s | reason=%s | patterns=%s | "
+                        "fall_m4=%.2f%% | fall_m3=%.2f%% | "
+                        "high_spread=%.2f%% | low_spread=%.2f%% | "
+                        "cooling_threshold=%.2f%% | recent_ranges=%s",
+                        symbol,
+                        "HISTORICAL_PATTERN_FAILED",
+                        historical_patterns,
+                        fall_from_m4_pct,
+                        fall_from_m3_pct,
+                        high_spread_pct,
+                        low_spread_pct,
+                        cooling_threshold_pct,
+                        [round(float(value), 3) for value in recent_day_ranges],
+                    )
+                    return symbol, None
+
+                selected_pattern = "+".join(historical_patterns)
 
                 avg_range_5d = (
                     float(
@@ -929,42 +834,27 @@ class NSEHighPerformanceTradingPipeline:
 
                 increment_counter("passed")
 
-                if strict_filter_11:
-                    selected_pattern = "D0-D10"
-                elif close_filter_11:
-                    selected_pattern = "D0-D10_CLOSE"
-                elif stabilized_decline_11:
-                    selected_pattern = "D0-D10_STABILIZED_DECLINE"
-                elif strict_filter_16:
-                    selected_pattern = "D0-D15"
-                elif close_filter_16:
-                    selected_pattern = "D0-D15_CLOSE"
-                else:
-                    selected_pattern = "D0-D15_STABILIZED_DECLINE"
-
                 log.info(
                     "NSE SELECTED | %s | "
                     "pattern=%s | "
                     "avg_trades_20d=%.2f | "
                     "last_5_avg_move=%.4f%% | "
-                    "older_max=%.2f | "
-                    "recent_max_D0_D10=%.2f | "
-                    "recent_max_D0_D15=%.2f | "
-                    "prior_decline_D0_D10=%.2f%% | "
-                    "prior_decline_D0_D15=%.2f%% | "
-                    "recent_range_D0_D10=%.2f%% | "
-                    "recent_range_D0_D15=%.2f%%",
+                    "high_spread=%.2f%% | low_spread=%.2f%% | "
+                    "fall_m4=%.2f%% | fall_m3=%.2f%% | "
+                    "avg_range_20d=%.2f%% | cooling_threshold=%.2f%% | "
+                    "recent_ranges=%s | 52w_position=%.2f%%",
                     symbol,
                     selected_pattern,
                     avg_trades_20d,
                     last_5_avg_move,
-                    older_max,
-                    recent_max_11,
-                    recent_max_16,
-                    prior_decline_pct_11,
-                    prior_decline_pct_16,
-                    recent_range_pct_11,
-                    recent_range_pct_16,
+                    high_spread_pct,
+                    low_spread_pct,
+                    fall_from_m4_pct,
+                    fall_from_m3_pct,
+                    avg_range_20d,
+                    cooling_threshold_pct,
+                    [round(float(value), 3) for value in recent_day_ranges],
+                    position_52w_pct,
                 )
 
                 return symbol, {
@@ -977,10 +867,16 @@ class NSEHighPerformanceTradingPipeline:
                         2,
                     ),
 
+                    "52_week_high": round(week_52_high, 2),
+                    "52_week_low": round(week_52_low, 2),
+                    "position_52w_pct": round(position_52w_pct, 2),
+
                     "avg_volume_20d": round(
                         avg_volume_20d,
                         2,
                     ),
+
+                    "avg_volume_5d": round(avg_volume_5d, 2),
 
                     "avg_turnover_20d": round(
                         avg_turnover_20d,
@@ -1058,23 +954,21 @@ class NSEHighPerformanceTradingPipeline:
                     "price_structure_filter":
                         selected_pattern,
 
-                    "prior_decline_d0_d10_pct":
-                        round(prior_decline_pct_11, 4),
-
-                    "prior_decline_d0_d15_pct":
-                        round(prior_decline_pct_16, 4),
-
-                    "recent_range_d0_d10_pct":
-                        round(recent_range_pct_11, 4),
-
-                    "recent_range_d0_d15_pct":
-                        round(recent_range_pct_16, 4),
-
-                    "stabilized_decline_d0_d10":
-                        stabilized_decline_11,
-
-                    "stabilized_decline_d0_d15":
-                        stabilized_decline_16,
+                    "historical_selected": historical_selected,
+                    "fall_from_m4": fall_from_m4,
+                    "fall_from_m3": fall_from_m3,
+                    "fall_from_m4_pct": round(fall_from_m4_pct, 4),
+                    "fall_from_m3_pct": round(fall_from_m3_pct, 4),
+                    "high_spread_pct": round(high_spread_pct, 4),
+                    "low_spread_pct": round(low_spread_pct, 4),
+                    "recent_cooling": recent_cooling,
+                    "cooling_threshold_pct": round(
+                        cooling_threshold_pct, 4
+                    ),
+                    "recent_day_ranges_pct": [
+                        round(float(value), 4)
+                        for value in recent_day_ranges
+                    ],
 
                     # ALL 22 NSE records.
                     "nse_data": records,
@@ -1222,18 +1116,23 @@ class NSEHighPerformanceTradingPipeline:
         )
 
         log.info(
-            "Price structure failed       : %d",
-            filter_counts["price_structure_failed"],
+            "Invalid 52-week range        : %d",
+            filter_counts["invalid_52week_range"],
         )
 
         log.info(
-            "Less than 5 daily moves      : %d",
-            filter_counts["less_than_5_daily_moves"],
+            "52-week position < 30%%       : %d",
+            filter_counts["low_52week_position"],
         )
 
         log.info(
-            "Average daily move >= 1%%     : %d",
-            filter_counts["average_daily_move_failed"],
+            "Historical pattern failed   : %d",
+            filter_counts["historical_pattern_failed"],
+        )
+
+        log.info(
+            "Recent cooling failed       : %d",
+            filter_counts["recent_cooling_failed"],
         )
 
         log.info(
@@ -1409,6 +1308,29 @@ class NSEHighPerformanceTradingPipeline:
             self.subscribe_filtered_stocks()
 
         def on_data(wsapp, message):
+            token = str(message.get("token", "")) if isinstance(message, dict) else ""
+            received_at = time.time()
+            with self.tick_stats_lock:
+                self.tick_stats["received"] += 1
+                stock_stats = self.tick_stats_by_token.setdefault(
+                    token or "unknown",
+                    {
+                        "symbol": self.live_cache.get(token, {}).get("symbol", ""),
+                        "received": 0,
+                        "evaluated": 0,
+                        "skipped": 0,
+                        "failed": 0,
+                        "last_received_at": None,
+                        "last_processed_at": None,
+                        "last_status": "awaiting_processing",
+                        "last_skip_reason": "",
+                    },
+                )
+                stock_stats["received"] += 1
+                stock_stats["last_received_at"] = received_at
+                stock_stats["symbol"] = self.live_cache.get(token, {}).get(
+                    "symbol", stock_stats.get("symbol", "")
+                )
             self.tick_queue.put(message)
 
         def on_error(wsapp, error):
@@ -1428,6 +1350,7 @@ class NSEHighPerformanceTradingPipeline:
     def subscribe_filtered_stocks(self):
         """Extracts stock symbols from self.volume_shockers, maps them to tokens, and subscribes via WebSocket."""
         target_tokens = []
+        self.tick_unmapped_symbols = []
         
         # 1) Extract clean stock symbols from self.volume_shockers data (stripping suffix like '.NS')
         volume_shocker_symbols = {
@@ -1444,7 +1367,8 @@ class NSEHighPerformanceTradingPipeline:
                 symbol_root = inst.get("symbol", "").split("-")[0].strip()
                 if symbol_root in volume_shocker_symbols:
                     token = str(inst.get("token")).strip()
-                    target_tokens.append(token)
+                    if token not in target_tokens:
+                        target_tokens.append(token)
                     if token not in self.live_cache:
                         self.live_cache[token] = {
                             "symbol": symbol_root,
@@ -1470,17 +1394,50 @@ class NSEHighPerformanceTradingPipeline:
                             "breakout_last_seen": 0.0,
                             "breakout_max_pullback_pct": 0.0
                         }
+                    with self.tick_stats_lock:
+                        self.tick_stats_by_token.setdefault(
+                            token,
+                            {
+                                "symbol": symbol_root,
+                                "received": 0,
+                                "evaluated": 0,
+                                "skipped": 0,
+                                "failed": 0,
+                                "last_received_at": None,
+                                "last_processed_at": None,
+                                "last_status": "awaiting_tick",
+                                "last_skip_reason": "",
+                                "subscription_requested": False,
+                            },
+                        )
+
+        mapped_symbols = {
+            self.live_cache[token].get("symbol", "")
+            for token in target_tokens
+            if token in self.live_cache
+        }
+        self.tick_unmapped_symbols = sorted(volume_shocker_symbols - mapped_symbols)
+        if self.tick_unmapped_symbols:
+            log.warning(
+                "NSE candidates without Angel One NSE tokens | count=%d | symbols=%s",
+                len(self.tick_unmapped_symbols),
+                ",".join(self.tick_unmapped_symbols),
+            )
 
         # 2) Connect and subscribe to WebSocket channels for each stock data
         if target_tokens and self.sws and self.sws.wsapp and self.sws.wsapp.sock and self.sws.wsapp.sock.connected:
             self.sws.subscribe(correlation_id="volume_shockers_sync", mode=3, token_list=[{"exchangeType": 1, "tokens": target_tokens}])
             self.active_stream_tokens.update(target_tokens)
+            with self.tick_stats_lock:
+                for token in target_tokens:
+                    if token in self.tick_stats_by_token:
+                        self.tick_stats_by_token[token]["subscription_requested"] = True
             log.info(f"Successfully subscribed to {len(target_tokens)} tokens from self.volume_shockers.")
 
 
     def run_continuous_funnel_loop(self):
         """Evaluate each subscribed tick and publish the current state to the web UI."""
-        log.info("Continuous live breakout confirmation loop online.")
+        log.info("Unified live stock rating loop online.")
 
         while True:
             try:
@@ -1494,36 +1451,123 @@ class NSEHighPerformanceTradingPipeline:
                         break
 
                 for msg in pending_messages:
-                    token = str(msg.get("token"))
-                    cache = self.live_cache.get(token)
-                    if not cache:
-                        continue
+                    try:
+                        token = str(msg.get("token", ""))
+                        cache = self.live_cache.get(token)
+                        if not cache:
+                            self._record_tick_status("skipped", token, "no_live_cache")
+                            continue
 
-                    symbol = cache.get("symbol", "")
-                    cs = self.analyze_tick_metrics(token, msg)
-                    if cs.get("ltp", 0) <= 0:
-                        continue
+                        symbol = cache.get("symbol", "")
+                        cs = self.analyze_tick_metrics(token, msg)
+                        if cs.get("ltp", 0) <= 0:
+                            self._record_tick_status("skipped", token, "invalid_ltp")
+                            continue
 
-                    past_data = self.volume_shockers.get(symbol)
-                    if not past_data:
-                        continue
+                        past_data = self.volume_shockers.get(symbol)
+                        if not past_data:
+                            self._record_tick_status("skipped", token, "no_historical_data")
+                            continue
 
-                    signal = self.evaluate_live_breakout(symbol, past_data, cs)
-                    btst_signal = self.evaluate_btst_candidate(symbol, past_data, cs)
-                    self._update_ui_state(
-                        symbol, token, cs, signal, btst_signal, past_data
-                    )
+                        signal = self.evaluate_unified_candidate(symbol, past_data, cs)
+                        self._update_ui_state(
+                            symbol, token, cs, signal, past_data
+                        )
+                        self._record_tick_status("evaluated", token)
+                    except Exception:
+                        self._record_tick_status("failed", token, "processing_exception")
+                        log.exception(
+                            "Failed to process one Angel One tick; continuing batch | token=%s",
+                            (msg.get("token") if isinstance(msg, dict) else "unknown"),
+                        )
 
             except queue.Empty:
                 log.debug("No ticker received within the 1-second queue wait.")
             except Exception:
                 log.exception("Error inside run_continuous_funnel_loop")
 
-    def _update_ui_state(self, symbol, token, cs, signal, btst_signal, past_data):
-        """Publish scanner state for the web dashboard without changing strategy logic."""
+    def _record_tick_status(self, status, token, detail=""):
+        """Count received-tick outcomes and periodically log processing coverage."""
+        with self.tick_stats_lock:
+            if status not in ("evaluated", "skipped", "failed"):
+                return
+            self.tick_stats[status] += 1
+            stock_stats = self.tick_stats_by_token.setdefault(
+                str(token or "unknown"),
+                {
+                    "symbol": self.live_cache.get(str(token), {}).get("symbol", ""),
+                    "received": 0,
+                    "evaluated": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "last_received_at": None,
+                    "last_processed_at": None,
+                    "last_status": "awaiting_tick",
+                    "last_skip_reason": "",
+                },
+            )
+            stock_stats[status] += 1
+            stock_stats["last_processed_at"] = time.time()
+            stock_stats["last_status"] = status
+            stock_stats["last_skip_reason"] = detail if status == "skipped" else ""
+            handled = (
+                self.tick_stats["evaluated"]
+                + self.tick_stats["skipped"]
+                + self.tick_stats["failed"]
+            )
+            if handled % 1000 != 0:
+                return
+            stats = dict(self.tick_stats)
+
+        log.info(
+            "Angel One tick processing | received=%d | evaluated=%d | skipped=%d | failed=%d | queued=%d",
+            stats["received"],
+            stats["evaluated"],
+            stats["skipped"],
+            stats["failed"],
+            self.tick_queue.qsize(),
+        )
+
+    def get_tick_processing_stats(self):
+        """Return aggregate and per-token received/processed tick counts."""
+        with self.tick_stats_lock:
+            aggregate = dict(self.tick_stats)
+            stocks = {
+                token: {
+                    **details,
+                    "queued": max(
+                        0,
+                        details["received"]
+                        - details["evaluated"]
+                        - details["skipped"]
+                        - details["failed"],
+                    ),
+                }
+                for token, details in self.tick_stats_by_token.items()
+            }
+        subscribed_tokens = [
+            token for token, details in stocks.items()
+            if details.get("subscription_requested")
+        ]
+        subscribed_symbols = sorted({
+            stocks[token].get("symbol", "") for token in subscribed_tokens
+            if stocks[token].get("symbol")
+        })
+
+        return {
+            "aggregate": aggregate,
+            "queue_depth": self.tick_queue.qsize(),
+            "historical_candidate_count": len(self.volume_shockers),
+            "subscription_requested_token_count": len(subscribed_tokens),
+            "subscription_requested_symbol_count": len(subscribed_symbols),
+            "symbols_without_token": list(self.tick_unmapped_symbols),
+            "stocks": stocks,
+        }
+
+    def _update_ui_state(self, symbol, token, cs, signal, past_data):
+        """Publish the unified rating and status for the web dashboard."""
         cache = self.live_cache.get(str(token), {})
-        cache["ui_live_signal"] = dict(signal) if signal else {}
-        cache["ui_btst_signal"] = dict(btst_signal) if btst_signal else {}
+        cache["ui_unified_signal"] = dict(signal) if signal else {}
         cache["ui_last_cs"] = dict(cs)
         cache["ui_updated_at"] = time.time()
 
@@ -1531,8 +1575,7 @@ class NSEHighPerformanceTradingPipeline:
         self.ui_state[str(symbol)] = {
             "token": str(token),
             "symbol": symbol,
-            "live_signal": dict(cache.get("ui_live_signal") or {}),
-            "btst_signal": dict(cache.get("ui_btst_signal") or {}),
+            "unified_signal": dict(cache.get("ui_unified_signal") or {}),
             "cs": dict(cs),
             "past_data": past_data,
             "updated_at": cache["ui_updated_at"],
@@ -1578,795 +1621,360 @@ class NSEHighPerformanceTradingPipeline:
             return (ltp - day_low) / (day_high - day_low) * 100.0
         return 50.0
 
-    def evaluate_live_breakout(
-        self,
-        symbol: str,
-        past_data: dict,
-        cs: dict
-    ) -> Optional[dict]:
-        """
-        Volume Shocker decision engine.
+    def _load_intraday_volume_profiles(self):
+        """Load persisted per-minute cumulative volume profiles by symbol/date."""
+        try:
+            with self.volume_profile_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            log.exception("Could not load saved intraday volume profiles")
+            return {}
 
-        IMPORTANT:
-        - Historical NSE data is the completed session baseline (D-1 and older).
-        - Today's decision uses ONLY live Angel One observations.
-        - A BUY requires agreement between price, volume pace, buying pressure,
-          range strength and a sustained breakout.
-        - Tick count is never treated as elapsed time. Breakout persistence is
-          measured with wall-clock seconds.
-        """
+    def _record_intraday_volume_profile(self, symbol, session_date, minute_index, volume):
+        """Keep one cumulative-volume observation per regular-session minute."""
+        if not symbol or minute_index < 0 or minute_index >= 375:
+            return
+
+        symbol_profiles = self.intraday_volume_profiles.setdefault(symbol, {})
+        profile = symbol_profiles.setdefault(session_date, [0] * 375)
+        if len(profile) < 375:
+            profile.extend([profile[-1] if profile else 0] * (375 - len(profile)))
+
+        previous_index = minute_index - 1
+        while previous_index >= 0 and profile[previous_index] <= 0:
+            previous_index -= 1
+        prior_volume = profile[previous_index] if previous_index >= 0 else 0
+        cumulative = max(int(volume or 0), int(prior_volume or 0))
+        for index in range(previous_index + 1, minute_index):
+            profile[index] = prior_volume
+        profile[minute_index] = cumulative
+
+        for old_date in sorted(symbol_profiles)[:-8]:
+            symbol_profiles.pop(old_date, None)
+
         now = time.time()
+        if now - self._volume_profile_last_save < 30:
+            return
+
+        try:
+            self.volume_profile_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.volume_profile_path.with_suffix(".tmp")
+            with temp_path.open("w", encoding="utf-8") as handle:
+                json.dump(self.intraday_volume_profiles, handle, separators=(",", ":"))
+            temp_path.replace(self.volume_profile_path)
+            self._volume_profile_last_save = now
+        except Exception:
+            log.exception("Could not persist intraday volume profiles")
+
+    def _volume_profile_ratio(self, symbol, session_date, minute_index, current_volume, avg_volume_5d):
+        """Compare today's cumulative volume with prior sessions at this minute."""
+        symbol_profiles = self.intraday_volume_profiles.get(symbol, {})
+        prior_dates = [day for day in sorted(symbol_profiles) if day < session_date][-5:]
+        baseline_values = [
+            int(symbol_profiles[day][minute_index])
+            for day in prior_dates
+            if minute_index < len(symbol_profiles[day])
+            and int(symbol_profiles[day][minute_index]) > 0
+        ]
+
+        if baseline_values:
+            ordered = sorted(baseline_values)
+            middle = len(ordered) // 2
+            baseline = (
+                ordered[middle]
+                if len(ordered) % 2
+                else (ordered[middle - 1] + ordered[middle]) / 2.0
+            )
+            ratio = current_volume / baseline if baseline > 0 else 0.0
+            source = "same_time_profile" if len(baseline_values) >= 5 else "partial_time_profile"
+            return ratio, baseline, len(baseline_values), source
+
+        elapsed_fraction = max(1.0 / 375.0, min(1.0, (minute_index + 1) / 375.0))
+        estimated_baseline = max(0.0, avg_volume_5d * elapsed_fraction)
+        ratio = current_volume / estimated_baseline if estimated_baseline > 0 else 0.0
+        return ratio, estimated_baseline, 0, "linear_daily_estimate"
+
+    def evaluate_unified_candidate(self, symbol, past_data, cs):
+        """Continuously score a live NSE candidate and assign its current state."""
         ltp = float(cs.get("ltp", 0) or 0)
         previous_close = float(cs.get("last_closed_price", 0) or 0)
-        if ltp <= 0 or previous_close <= 0:
+        token = str(cs.get("token", ""))
+        cache = self.live_cache.get(token)
+        if ltp <= 0 or previous_close <= 0 or cache is None:
             return None
 
-        position_52w_pct = cs.get("position_52w_pct")
-        if position_52w_pct is None:
-            return None
-        
-        try:
-            position_52w_pct = float(position_52w_pct)
-        except (TypeError, ValueError):
-            return None
-        
-        if position_52w_pct < 30.0:
-            return None
-
-        
-
-        avg_volume = float(past_data.get("avg_volume_20d", 0) or 0)
-        avg_trades = float(past_data.get("avg_trades_20d", 0) or 0)
-        avg_turnover = float(past_data.get("avg_turnover_20d", 0) or 0)
-        recent_5_high = float(past_data.get("recent_5_high", 0) or 0)
-        recent_10_high = float(past_data.get("recent_10_high", 0) or 0)
-        recent_20_high = float(past_data.get("recent_20_high", 0) or 0)
-
-        if avg_volume <= 0 or recent_5_high <= 0:
-            return None
-
-        current_volume = float(cs.get("current_volume", 0) or 0)
-        current_turnover = float(cs.get("current_turnover", 0) or 0)
-        buying_pressure = float(cs.get("buying_pressure", 0.5) or 0.5)
+        now = time.time()
+        symbol = str(symbol or "").strip()
+        gain_pct = (ltp - previous_close) / previous_close * 100.0
+        current_volume = int(float(cs.get("current_volume", 0) or 0))
+        buying_pressure = max(0.0, min(1.0, float(cs.get("buying_pressure", 0.5) or 0.0)))
         day_high = float(cs.get("day_high", ltp) or ltp)
         day_low = float(cs.get("day_low", ltp) or ltp)
 
-        # ------------------------------------------------------------------
-        # Store timestamped live observations. This is what makes the price
-        # stabilization and breakout persistence time-based rather than tick-
-        # based. One tick every millisecond does NOT count as one minute.
-        # ------------------------------------------------------------------
-        token = str(cs.get("token", ""))
-        cache = self.live_cache.get(token)
-        if cache is None:
-            return None
         samples = cache.setdefault("live_samples", deque(maxlen=1800))
         samples.append({
             "ts": now,
             "ltp": ltp,
             "volume": current_volume,
             "buy_pressure": buying_pressure,
-            "day_high": day_high,
-            "day_low": day_low,
         })
 
         def window(seconds):
             cutoff = now - seconds
-            return [x for x in samples if x["ts"] >= cutoff]
+            return [sample for sample in samples if sample.get("ts", 0) >= cutoff]
 
-        w60 = window(60)
-        w180 = window(180)
-        w300 = window(300)
+        def change_pct(window_samples):
+            if len(window_samples) < 2 or float(window_samples[0].get("ltp", 0) or 0) <= 0:
+                return 0.0
+            first = float(window_samples[0]["ltp"])
+            return (ltp - first) / first * 100.0
 
-        # ------------------------------------------------------------------
-        # Intraday pace. Linear elapsed-time normalization is the best
-        # available baseline when only daily NSE totals are stored. It avoids
-        # comparing 10:00 AM volume directly with a full-day historical total.
-        # ------------------------------------------------------------------
-        elapsed_fraction = self._market_elapsed_fraction()
-        expected_volume_to_now = avg_volume * elapsed_fraction
-        rvol_pace = (
-            current_volume / expected_volume_to_now
-            if expected_volume_to_now > 0 else 0.0
-        )
-        turnover_pace = (
-            current_turnover / (avg_turnover * elapsed_fraction)
-            if avg_turnover > 0 and current_turnover > 0 else 0.0
-        )
+        w5 = window(300)
+        w15 = window(900)
+        w30 = window(1800)
+        change_5m = change_pct(w5)
+        change_15m = change_pct(w15)
 
-        # Actual executed trade count is not normally present in Angel One
-        # FULL packets. If a broker payload supplies it, use it; otherwise do
-        # NOT pretend best-5 order counts are executed trades.
-        live_trade_count = 0.0
-        for key in (
-            "trade_count", "number_of_trades", "no_of_trades",
-            "no.oftrades", "no_of_trade", "trades"
-        ):
-            if msg_value := cs.get(key):
-                try:
-                    live_trade_count = float(msg_value)
+        # Compare the most recent 15 minutes with the preceding 15 minutes to
+        # detect fresh lows and higher lows without treating every tick as a bar.
+        prior_15 = [sample for sample in w30 if sample.get("ts", 0) < now - 900]
+        recent_15 = [sample for sample in w30 if sample.get("ts", 0) >= now - 900]
+        prior_low = min((float(x.get("ltp", ltp)) for x in prior_15), default=0.0)
+        recent_low = min((float(x.get("ltp", ltp)) for x in recent_15), default=0.0)
+        enough_low_history = len(prior_15) >= 2 and len(recent_15) >= 2 and prior_low > 0
+        no_new_low = (recent_low >= prior_low * 0.998) if enough_low_history else None
+        higher_low = (recent_low > prior_low * 1.001) if enough_low_history else False
+
+        avg_range_20 = max(0.0, float(past_data.get("avg_range_20d_pct", 0) or 0))
+        recent_range_30 = 0.0
+        if len(w30) >= 3:
+            prices = [float(x.get("ltp", 0) or 0) for x in w30 if float(x.get("ltp", 0) or 0) > 0]
+            if prices:
+                recent_range_30 = (max(prices) - min(prices)) / previous_close * 100.0
+
+        # Historical trend and settling are continuous score components.
+        records = past_data.get("nse_data") or []
+        rows = []
+        for row in records:
+            try:
+                close = float(row.get("ClosePrice", 0) or 0)
+                high = float(row.get("HighPrice", 0) or 0)
+                low = float(row.get("LowPrice", 0) or 0)
+                if close > 0:
+                    rows.append({"close": close, "high": high, "low": low})
+            except (TypeError, ValueError):
+                continue
+
+        month_change = 0.0
+        five_day_change = 0.0
+        if len(rows) >= 2:
+            month_change = (rows[0]["close"] / rows[min(20, len(rows) - 1)]["close"] - 1.0) * 100.0
+            five_day_change = (rows[0]["close"] / rows[min(5, len(rows) - 1)]["close"] - 1.0) * 100.0
+
+        trend_score = 10.0
+        if month_change < -8.0:
+            trend_score -= 6.0
+        elif month_change < -3.0:
+            trend_score -= 4.0
+        elif month_change < 0:
+            trend_score -= 2.0
+        else:
+            trend_score += 3.0
+        if five_day_change < -3.0:
+            trend_score -= 3.0
+        elif five_day_change > 0:
+            trend_score += 2.0
+        if past_data.get("higher_low_structure"):
+            trend_score += 2.0
+        trend_score = max(0.0, min(15.0, trend_score))
+
+        # Count consecutive completed sessions from D0, capped at D2. Each
+        # cooled day contributes 2.4 historical settling points.
+        stable_days = 0
+        if avg_range_20 > 0:
+            cooling_limit_pct = min(2.0, 0.8 * avg_range_20)
+            for row in rows[:3]:
+                if row["high"] <= 0 or row["low"] <= 0:
                     break
-                except (TypeError, ValueError):
-                    pass
-        trade_pace = (
-            live_trade_count / (avg_trades * elapsed_fraction)
-            if live_trade_count > 0 and avg_trades > 0 else 0.0
+                daily_range = (row["high"] - row["low"]) / row["low"] * 100.0
+                if daily_range <= cooling_limit_pct:
+                    stable_days += 1
+                else:
+                    break
+        historical_settling_score = min(15.0, stable_days * 2.4)
+        avg_range_5 = max(0.0, float(past_data.get("avg_range_5d_pct", 0) or 0))
+        if avg_range_20 > 0 and avg_range_5 > 0:
+            compression_ratio = avg_range_5 / avg_range_20
+            historical_settling_score += 3.0 if compression_ratio <= 0.7 else (1.5 if compression_ratio <= 0.9 else 0.0)
+        if past_data.get("higher_low_structure"):
+            historical_settling_score += 1.0
+        historical_settling_score = min(15.0, historical_settling_score)
+
+        live_settling_score = 0.0
+        if len(w30) >= 3 and avg_range_20 > 0:
+            expected_30m_range = avg_range_20 * (30.0 / 375.0) ** 0.5
+            range_ratio = recent_range_30 / expected_30m_range if expected_30m_range > 0 else 99.0
+            live_settling_score += 9.0 if range_ratio <= 0.65 else (6.0 if range_ratio <= 1.0 else (3.0 if range_ratio <= 1.4 else 0.0))
+            if no_new_low is True:
+                live_settling_score += 3.0
+            if higher_low:
+                live_settling_score += 3.0
+        live_settling_score = min(15.0, live_settling_score)
+
+        local_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        session_date = local_now.strftime("%Y-%m-%d")
+        minute_index = (local_now.hour * 60 + local_now.minute) - (9 * 60 + 15)
+        if 0 <= minute_index < 375:
+            self._record_intraday_volume_profile(
+                symbol,
+                session_date,
+                minute_index,
+                current_volume,
+            )
+        daily_volumes = []
+        for row in past_data.get("nse_data") or []:
+            try:
+                row_date = str(row.get("Date", ""))[:10]
+                value = float(row.get("TotalTradedQuantity", 0) or 0)
+                if row_date and row_date < session_date and value > 0:
+                    daily_volumes.append(value)
+            except (TypeError, ValueError):
+                continue
+            if len(daily_volumes) >= 5:
+                break
+        avg_volume_5d = sum(daily_volumes) / len(daily_volumes) if daily_volumes else 0.0
+        volume_ratio, expected_volume, profile_days, volume_baseline = self._volume_profile_ratio(
+            symbol,
+            session_date,
+            max(0, min(374, minute_index)),
+            current_volume,
+            avg_volume_5d,
         )
+        volume_score = 10.0 if volume_baseline == "linear_daily_estimate" else 0.0
+        if volume_ratio >= 1.5:
+            volume_score = 20.0
+        elif volume_ratio >= 1.2:
+            volume_score = 16.0
+        elif volume_ratio >= 1.0:
+            volume_score = 13.0
+        elif volume_ratio >= 0.75:
+            volume_score = 8.0
+        elif volume_baseline != "linear_daily_estimate":
+            volume_score = 4.0
 
-        # ------------------------------------------------------------------
-        # Price stabilization / exhaustion.
-        # We want the recent fall to stop making new lows before calling it
-        # absorption. This is deliberately tolerant of normal noise.
-        # ------------------------------------------------------------------
-        stabilization = False
-        no_new_low_90s = False
-        short_range_pct = 999.0
-        if len(w180) >= 3:
-            recent_prices = [x["ltp"] for x in w180]
-            low_180 = min(recent_prices)
-            high_180 = max(recent_prices)
-            short_range_pct = (
-                (high_180 - low_180) / previous_close * 100.0
-                if previous_close > 0 else 999.0
-            )
-            low_90 = min(x["ltp"] for x in window(90))
-            no_new_low_90s = ltp >= low_90 * 0.999
-            price_change_180 = (ltp - recent_prices[0]) / recent_prices[0] * 100.0
-            stabilization = (
-                (short_range_pct <= 0.60 and price_change_180 >= -0.20)
-                or (
-                    no_new_low_90s
-                    and ltp >= low_180 * 1.001
-                    and price_change_180 >= -0.20
-                )
-            )
-
-        # Current price direction over a real time window, not one tick.
-        price_rising_60s = False
-        price_rising_180s = False
-        if len(w60) >= 2:
-            first = w60[0]["ltp"]
-            price_rising_60s = ltp > first * 1.0005
-        if len(w180) >= 2:
-            first = w180[0]["ltp"]
-            price_rising_180s = ltp > first * 1.001
-
-        # ------------------------------------------------------------------
-        # Breakout levels. Use the highest recent resistance that is actually
-        # relevant. We do not call a 5D breakout a 10D breakout accidentally.
-        # ------------------------------------------------------------------
-        resistance_levels = [
-            (recent_5_high, "5D"),
-            (recent_10_high, "10D"),
-            (recent_20_high, "20D"),
-        ]
-        resistance_levels = [(p, n) for p, n in resistance_levels if p > 0]
-
-        # Highest historical resistance is the strongest breakout. For the
-        # watch state, use the nearest resistance above price.
-        above_levels = [(p, n) for p, n in resistance_levels if ltp >= p]
-        if above_levels:
-            breakout_level, breakout_type = max(above_levels, key=lambda x: x[0])
+        price_score = 0.0
+        if change_15m > 0.5:
+            price_score += 8.0
+        elif change_15m > 0.1:
+            price_score += 6.0
+        elif change_15m > 0:
+            price_score += 4.0
+        elif change_15m < -0.5:
+            price_score += 0.0
         else:
-            breakout_level, breakout_type = min(
-                resistance_levels,
-                key=lambda x: max(0.0, (x[0] - ltp) / x[0])
-            )
+            price_score += 2.0
+        price_score += 5.0 if gain_pct > 0 else (2.0 if gain_pct >= -0.5 else 0.0)
+        if volume_ratio >= 1.2 and change_15m > 0:
+            price_score += 5.0
+        price_score = min(20.0, price_score)
 
-        above_breakout = ltp >= breakout_level
-        distance_to_breakout_pct = (
-            (breakout_level - ltp) / breakout_level * 100.0
-            if breakout_level > 0 else 999.0
-        )
+        pressure_samples = w15
+        earlier_pressure = float(pressure_samples[0].get("buy_pressure", buying_pressure)) if len(pressure_samples) >= 2 else buying_pressure
+        pressure_delta = buying_pressure - earlier_pressure
+        pressure_score = 3.0
+        if buying_pressure >= 0.62:
+            pressure_score = 8.0
+        elif buying_pressure >= 0.57:
+            pressure_score = 7.0
+        elif buying_pressure >= 0.52:
+            pressure_score = 6.0
+        elif buying_pressure >= 0.45:
+            pressure_score = 4.0
+        if pressure_delta >= 0.05:
+            pressure_score += 2.0
+        elif pressure_delta <= -0.05:
+            pressure_score -= 2.0
+        pressure_score = max(0.0, min(10.0, pressure_score))
 
-        # ------------------------------------------------------------------
-        # Time-based breakout persistence.
-        # Require at least 180 seconds above the breakout level for BUY.
-        # A brief dip below the level is tolerated only if it is <0.25% and
-        # the stock quickly recovers.
-        # ------------------------------------------------------------------
-        if above_breakout:
-            if cache.get("last_breakout_level", 0) != breakout_level:
-                cache["last_breakout_level"] = breakout_level
-                cache["breakout_first_seen"] = now
-                cache["breakout_last_seen"] = now
-                cache["breakout_max_pullback_pct"] = 0.0
-            else:
-                cache["breakout_last_seen"] = now
+        recovery_score = 0.0
+        if no_new_low is True:
+            recovery_score += 2.0
+        if higher_low:
+            recovery_score += 1.5
+        if change_15m > 0.1 and gain_pct < 0:
+            recovery_score += 1.5
 
-            elapsed_breakout_seconds = max(
-                0.0, now - float(cache.get("breakout_first_seen", now))
-            )
-            cache["breakout_max_pullback_pct"] = max(
-                float(cache.get("breakout_max_pullback_pct", 0.0)),
-                max(0.0, (breakout_level - ltp) / breakout_level * 100.0)
-            )
-        else:
-            elapsed_breakout_seconds = 0.0
-            # Reset only when price is materially below resistance.
-            if distance_to_breakout_pct > 0.75:
-                cache["breakout_first_seen"] = 0.0
-                cache["breakout_last_seen"] = 0.0
-                cache["last_breakout_level"] = 0.0
-                cache["breakout_max_pullback_pct"] = 0.0
+        rating = int(round(min(100.0, max(0.0,
+            trend_score + historical_settling_score + live_settling_score
+            + volume_score + price_score + pressure_score + recovery_score
+        ))))
 
-        breakout_persistent = (
-            above_breakout
-            and elapsed_breakout_seconds >= 180.0
-            and float(cache.get("breakout_max_pullback_pct", 0.0)) <= 0.25
-        )
-
-        # ------------------------------------------------------------------
-        # Price/volume relationship.
-        # ------------------------------------------------------------------
-        gain_pct = (ltp - previous_close) / previous_close * 100.0
-        volume_strong = rvol_pace >= 1.5
-        volume_very_strong = rvol_pace >= 2.0
-        price_volume_bullish = (
-            current_volume > 0
-            and volume_strong
-            and (price_rising_60s or gain_pct > 0)
-        )
-        absorption = (
-            volume_strong
-            and abs(gain_pct) <= 0.50
-            and stabilization
+        price_up = change_15m > 0.1 or gain_pct > 0
+        volume_confirmed = volume_ratio >= 1.0
+        pressure_supportive = buying_pressure >= 0.52
+        break_move = (
+            change_5m >= 1.0
+            and volume_ratio >= 1.2
             and buying_pressure >= 0.55
+            and len(w5) >= 3
         )
-        distribution_warning = (
-            volume_strong
-            and gain_pct < -0.50
-            and self._close_position(ltp, day_high, day_low) < 40.0
-            and buying_pressure < 0.50
-        )
-
-        # ------------------------------------------------------------------
-        # Score: historical readiness 30 + live confirmation 70.
-        # Live confirmation is intentionally dominant for a Volume Shocker.
-        # ------------------------------------------------------------------
-        historical_score = 0
-        historical_reasons = []
-        historical_score += 8  # already passed NSE eligibility
-        historical_reasons.append("NSE volume-shocker universe passed")
-
-        if abs(float(past_data.get("last_5_avg_daily_move", 0) or 0)) < 1.0:
-            historical_score += 5
-            historical_reasons.append("recent price movement controlled")
-
-        compression = float(past_data.get("close_compression_5d_pct", 999) or 999)
-        if compression <= 3.0:
-            historical_score += 7
-            historical_reasons.append("5D compression")
-
-        if past_data.get("higher_low_structure", False):
-            historical_score += 5
-            historical_reasons.append("higher-low structure")
-
-        distance_10d = float(past_data.get("distance_from_10d_high_pct", 999) or 999)
-        if distance_10d <= 5.0:
-            historical_score += 5
-            historical_reasons.append("near 10D high")
-
-        live_score = 0
-        live_reasons = []
-
-        if volume_very_strong:
-            live_score += 15
-            live_reasons.append(f"RVOL {rvol_pace:.2f}x")
-        elif volume_strong:
-            live_score += 11
-            live_reasons.append(f"RVOL {rvol_pace:.2f}x")
-        elif rvol_pace >= 1.2:
-            live_score += 6
-            live_reasons.append(f"RVOL {rvol_pace:.2f}x")
-
-        if price_volume_bullish:
-            live_score += 12
-            live_reasons.append("price + volume aligned bullish")
-        elif absorption:
-            live_score += 8
-            live_reasons.append("high-volume absorption / stabilization")
-        elif volume_strong and gain_pct < 0:
-            live_reasons.append("volume rising while price falls")
-
-        if buying_pressure >= 0.65:
-            live_score += 14
-            live_reasons.append(f"buy pressure {buying_pressure * 100:.1f}%")
-        elif buying_pressure >= 0.60:
-            live_score += 10
-            live_reasons.append(f"buy pressure {buying_pressure * 100:.1f}%")
-        elif buying_pressure >= 0.55:
-            live_score += 5
-            live_reasons.append(f"buy pressure {buying_pressure * 100:.1f}%")
-
-        if stabilization:
-            live_score += 7
-            live_reasons.append("price stabilized")
-        if price_rising_60s:
-            live_score += 5
-            live_reasons.append("price rising over 60s")
-        if price_rising_180s:
-            live_score += 4
-            live_reasons.append("price rising over 3m")
-
-        close_position = self._close_position(ltp, day_high, day_low)
-        if close_position >= 85:
-            live_score += 7
-            live_reasons.append(f"near day high ({close_position:.0f}%)")
-        elif close_position >= 70:
-            live_score += 4
-            live_reasons.append(f"strong range position ({close_position:.0f}%)")
-
-        if above_breakout:
-            live_score += 10
-            live_reasons.append(f"above {breakout_type} resistance")
-        elif distance_to_breakout_pct <= 1.0:
-            live_score += 5
-            live_reasons.append(f"within {distance_to_breakout_pct:.2f}% of resistance")
-
-        if turnover_pace >= 1.5:
-            live_score += 3
-            live_reasons.append(f"turnover pace {turnover_pace:.2f}x")
-
-        if trade_pace > 0:
-            if trade_pace >= 1.5:
-                live_score += 3
-                live_reasons.append(f"executed-trade pace {trade_pace:.2f}x")
-            elif trade_pace >= 1.2:
-                live_score += 2
-                live_reasons.append(f"executed-trade pace {trade_pace:.2f}x")
-        else:
-            order_activity = (
-                float(cs.get("total_buy_orders", 0) or 0)
-                + float(cs.get("total_sell_orders", 0) or 0)
-            )
-            prev_order_activity = (
-                float(cs.get("prev_total_orders", 0) or 0)
-            )
-            if order_activity > 0 and prev_order_activity > 0 and order_activity > prev_order_activity:
-                live_reasons.append("order-book participation increasing")
-
-        # ------------------------------------------------------------------
-        # Final decision.
-        # ------------------------------------------------------------------
-        total_score = min(100, historical_score + live_score)
-
-        # Distribution is an explicit veto.
-        if distribution_warning:
-            recommendation = "WAIT"
-            status = "🔴 DISTRIBUTION / WAIT"
+        if break_move:
+            recommendation = "BREAK"
+            status = "🔵 BREAK"
         elif (
-            total_score >= 75
-            and above_breakout
-            and breakout_persistent
-            and buying_pressure >= 0.60
-            and close_position >= 70
-            and (price_volume_bullish or price_rising_180s)
+            rating >= 70
+            and price_up
+            and volume_confirmed
+            and pressure_supportive
+            and no_new_low is True
+            and live_settling_score >= 6.0
         ):
             recommendation = "BUY"
-            status = "🚀 VOLUME SHOCKER BUY"
-        elif (
-            total_score >= 60
-            and (
-                above_breakout
-                or distance_to_breakout_pct <= 1.0
-                or absorption
-            )
-        ):
+            status = "🟢 BUY"
+        elif rating >= 40 or price_up or volume_ratio >= 1.2:
             recommendation = "WATCH"
-            status = "🟡 VOLUME SHOCKER WATCH"
-        elif (
-            absorption
-            and rvol_pace >= 1.2
-            and buying_pressure >= 0.55
-        ):
+            status = "🟡 WATCH"
+        else:
             recommendation = "WAIT"
-            status = "🟡 ABSORPTION / WAIT FOR BREAKOUT"
-        else:
-            return None
-
-        if recommendation == "BUY":
-            priority = 3
-        elif recommendation == "WATCH":
-            priority = 2
-        else:
-            priority = 1
+            status = "🔴 WAIT"
 
         return {
             "symbol": symbol,
-            "score": int(total_score),
+            "score": rating,
+            "rating": rating,
             "recommendation": recommendation,
             "status": status,
             "ltp": round(ltp, 2),
             "gain": round(gain_pct, 2),
-                        "buy": round(buying_pressure * 100, 2),
-            "sell": round((1.0 - buying_pressure) * 100, 2),
-            "vol": round(rvol_pace, 2),
-            "trades": round(trade_pace, 2) if trade_pace > 0 else None,
-            "turnover": round(turnover_pace, 2),
-            "close_pos": round(close_position, 1),
-            "day_range": round((day_high - day_low) / previous_close * 100.0, 2),
-            "resistance": round(breakout_level, 2),
-            "distance": round(distance_to_breakout_pct, 2),
-            "breakout_hold_seconds": int(elapsed_breakout_seconds),
-            "breakout_persistent": breakout_persistent,
-            "price_stable": stabilization,
-            "price_rising_60s": price_rising_60s,
-            "price_rising_180s": price_rising_180s,
-            "price_volume_bullish": price_volume_bullish,
-            "absorption": absorption,
-            "historical_score": int(historical_score),
-            "live_score": int(live_score),
-            "reason": "; ".join(historical_reasons + live_reasons)[:700],
-            "priority": priority,
-        }
-
-    def evaluate_btst_candidate(
-        self,
-        symbol: str,
-        past_data: dict,
-        cs: dict
-    ) -> Optional[dict]:
-        """
-        End-of-day BTST preparation engine.
-
-        This is intentionally separate from the live-breakout BUY engine.
-        It looks for stocks that may be worth analyzing near the close for a
-        next-session move: absorption, compression, recovery, or controlled
-        breakout preparation.
-
-        Important: this is a CANDIDATE ranker, not an automatic BUY signal.
-        Price is allowed to be falling, flat, or rising as long as the
-        behaviour is healthy (stabilizing, holding, recovering, or controlled).
-        Persistent new lows / distribution are strong negative evidence.
-        """
-        now = time.time()
-        ltp = float(cs.get("ltp", 0) or 0)
-        previous_close = float(cs.get("last_closed_price", 0) or 0)
-        if ltp <= 0 or previous_close <= 0:
-            return None
-
-        # ---------------------------------------------------------------
-        # BTST 52-WEEK POSITION FILTER
-        #
-        # Angel One FULL-mode data supplies the current 52W high/low.
-        # Keep only stocks trading at/above the midpoint of that range.
-        #
-        # 50% = exact 52W midpoint.
-        # ---------------------------------------------------------------
-        position_52w_pct = cs.get("position_52w_pct")
-        if position_52w_pct is None:
-            return None
-
-        try:
-            position_52w_pct = float(position_52w_pct)
-        except (TypeError, ValueError):
-            return None
-
-        if position_52w_pct < 30.0:
-            return None
-
-        avg_volume = float(past_data.get("avg_volume_20d", 0) or 0)
-        avg_turnover = float(past_data.get("avg_turnover_20d", 0) or 0)
-        resistance_5 = float(past_data.get("recent_5_high", 0) or 0)
-        resistance_10 = float(past_data.get("recent_10_high", 0) or 0)
-        resistance_20 = float(past_data.get("recent_20_high", 0) or 0)
-        if avg_volume <= 0:
-            return None
-
-        token = str(cs.get("token", ""))
-        cache = self.live_cache.get(token)
-        if cache is None:
-            return None
-
-        samples = cache.setdefault("live_samples", deque(maxlen=1800))
-        # evaluate_live_breakout normally appends first; this fallback keeps
-        # the BTST engine safe if it is called independently later.
-        if not samples or samples[-1].get("ts") != now:
-            samples.append({
-                "ts": now,
-                "ltp": ltp,
-                "volume": float(cs.get("current_volume", 0) or 0),
-                "buy_pressure": float(cs.get("buying_pressure", 0.5) or 0.5),
-                "day_high": float(cs.get("day_high", ltp) or ltp),
-                "day_low": float(cs.get("day_low", ltp) or ltp),
-            })
-
-        def window(seconds):
-            cutoff = now - seconds
-            return [x for x in samples if x["ts"] >= cutoff]
-
-        w60 = window(60)
-        w180 = window(180)
-        w300 = window(300)
-        w600 = window(600)
-        if len(w180) < 3:
-            return None
-
-        elapsed_fraction = self._market_elapsed_fraction()
-        current_volume = float(cs.get("current_volume", 0) or 0)
-        current_turnover = float(cs.get("current_turnover", 0) or 0)
-        buying_pressure = float(cs.get("buying_pressure", 0.5) or 0.5)
-
-        expected_volume = avg_volume * elapsed_fraction
-        rvol_pace = current_volume / expected_volume if expected_volume > 0 else 0.0
-        turnover_pace = (
-            current_turnover / (avg_turnover * elapsed_fraction)
-            if avg_turnover > 0 and current_turnover > 0 else 0.0
-        )
-
-        prices_180 = [x["ltp"] for x in w180]
-        prices_300 = [x["ltp"] for x in w300] or prices_180
-        low_180 = min(prices_180)
-        high_180 = max(prices_180)
-        range_180_pct = (high_180 - low_180) / previous_close * 100.0
-
-        # Recent-low tolerance for BTST:
-        # A tiny dip below the recent low is normal market noise. Treat
-        # 0% to -0.50% as a SOFT_NEW_LOW rather than rejecting the setup.
-        # A move below -0.50% is treated as a genuine NEW_LOW.
-        low_90_samples = window(90)
-        low_90 = min(x["ltp"] for x in low_90_samples) if low_90_samples else ltp
-        distance_from_low_pct = (
-            (ltp - low_90) / low_90 * 100.0
-            if low_90 > 0 else 0.0
-        )
-        no_new_low = distance_from_low_pct >= -0.50
-        soft_new_low = -0.50 <= distance_from_low_pct < 0.0
-        hard_new_low = distance_from_low_pct < -0.50
-
-        first_180 = prices_180[0]
-        change_180 = (ltp - first_180) / first_180 * 100.0 if first_180 > 0 else 0.0
-        first_300 = prices_300[0]
-        change_300 = (ltp - first_300) / first_300 * 100.0 if first_300 > 0 else 0.0
-
-        # Higher-low structure: compare the recent low with the older part of
-        # the 5-minute window. It is intentionally tolerant of tiny noise.
-        higher_low = False
-        if len(w300) >= 6:
-            mid = len(w300) // 2
-            older_low = min(x["ltp"] for x in w300[:mid])
-            recent_low = min(x["ltp"] for x in w300[mid:])
-            higher_low = recent_low >= older_low * 0.9995
-
-        # Pressure trend is more useful than one snapshot.
-        pressure_rising = False
-        pressure_weakening = False
-        if len(w180) >= 4:
-            mid = len(w180) // 2
-            p_old = sum(x["buy_pressure"] for x in w180[:mid]) / max(1, mid)
-            p_new = sum(x["buy_pressure"] for x in w180[mid:]) / max(1, len(w180) - mid)
-            pressure_rising = p_new >= p_old + 0.025
-            pressure_weakening = p_new <= p_old - 0.025
-
-        price_rising_60 = len(w60) >= 2 and ltp > w60[0]["ltp"] * 1.0005
-        price_rising_180 = len(w180) >= 2 and ltp > w180[0]["ltp"] * 1.001
-        price_falling_180 = change_180 < -0.20
-
-        stabilization = (
-            (range_180_pct <= 0.75 and change_180 >= -0.35)
-            or (no_new_low and higher_low and change_180 >= -0.35)
-        )
-        recovery = (
-            no_new_low
-            and (price_rising_60 or price_rising_180)
-            and (change_180 >= -0.20 or higher_low)
-        )
-        compression = (
-            range_180_pct <= 0.60
-            and no_new_low
-            and not pressure_weakening
-        )
-
-        # Volume should be meaningful, but a late-day BTST candidate does not
-        # need a full breakout today. Persistent participation is preferred.
-        volume_strong = rvol_pace >= 1.20
-        volume_very_strong = rvol_pace >= 1.50
-        volume_fading = False
-        if len(w300) >= 6:
-            mid = len(w300) // 2
-            v_old = w300[mid - 1]["volume"]
-            v_new = w300[-1]["volume"]
-            volume_fading = v_new < v_old * 0.85
-
-        gain_pct = (ltp - previous_close) / previous_close * 100.0
-        day_high = float(cs.get("day_high", ltp) or ltp)
-        day_low = float(cs.get("day_low", ltp) or ltp)
-        close_position = self._close_position(ltp, day_high, day_low)
-
-        # Do not chase a stock that has already made an outsized move today.
-        extended = gain_pct >= 7.0
-        overextended = gain_pct >= 10.0
-
-        resistances = [p for p in (resistance_5, resistance_10, resistance_20) if p > 0]
-        nearest_resistance = min((p for p in resistances if p >= ltp), default=max(resistances) if resistances else 0.0)
-        distance_to_resistance = (
-            (nearest_resistance - ltp) / nearest_resistance * 100.0
-            if nearest_resistance > 0 else 999.0
-        )
-        near_resistance = 0.0 <= distance_to_resistance <= 3.0
-
-        # Strong negative condition: high participation + falling pressure +
-        # persistent lows. This is distribution, not BTST preparation.
-        distribution = (
-            volume_strong
-            and pressure_weakening
-            and not no_new_low
-            and gain_pct < -0.50
-        )
-        if distribution:
-            return None
-
-        score = 0
-        reasons = []
-        pattern_points = {
-            "ABSORPTION": 0,
-            "COMPRESSION": 0,
-            "RECOVERY": 0,
-            "BREAKOUT PREPARATION": 0,
-        }
-
-        # Historical readiness.
-        score += 10
-        reasons.append("NSE historical filter passed")
-        if float(past_data.get("close_compression_5d_pct", 999) or 999) <= 3.0:
-            score += 6
-            reasons.append("5D compression")
-        if past_data.get("higher_low_structure", False):
-            score += 5
-            reasons.append("historical higher-low")
-
-        if volume_very_strong:
-            score += 15
-            reasons.append(f"RVOL {rvol_pace:.2f}x")
-        elif volume_strong:
-            score += 11
-            reasons.append(f"RVOL {rvol_pace:.2f}x")
-        elif rvol_pace >= 1.05:
-            score += 5
-            reasons.append(f"RVOL {rvol_pace:.2f}x")
-
-        if pressure_rising:
-            score += 12
-            reasons.append("buy pressure rising")
-        if buying_pressure >= 0.62:
-            score += 10
-            reasons.append(f"buy pressure {buying_pressure * 100:.0f}%")
-        elif buying_pressure >= 0.57:
-            score += 6
-            reasons.append(f"buy pressure {buying_pressure * 100:.0f}%")
-        elif buying_pressure < 0.45:
-            score -= 8
-            reasons.append("weak buy pressure")
-
-        if not hard_new_low:
-            if soft_new_low:
-                score += 3
-                reasons.append(f"soft new low {distance_from_low_pct:.2f}% (within -0.50%)")
-            else:
-                score += 8
-                reasons.append("no new low")
-        else:
-            score -= 10
-            reasons.append(f"new low {distance_from_low_pct:.2f}%")
-
-        if higher_low:
-            score += 7
-            reasons.append("higher low")
-
-        if stabilization:
-            score += 9
-            reasons.append("stabilizing")
-            pattern_points["ABSORPTION"] += 10
-
-        if compression:
-            score += 8
-            reasons.append("tight compression")
-            pattern_points["COMPRESSION"] += 12
-
-        if recovery:
-            score += 10
-            reasons.append("recovery")
-            pattern_points["RECOVERY"] += 14
-
-        if near_resistance and not overextended:
-            score += 6
-            reasons.append(f"near resistance {nearest_resistance:.2f}")
-            pattern_points["BREAKOUT PREPARATION"] += 10
-
-        if price_rising_60 and volume_strong:
-            score += 5
-            reasons.append("controlled rise with participation")
-
-        if turnover_pace >= 1.2:
-            score += 3
-            reasons.append(f"turnover pace {turnover_pace:.2f}x")
-
-        # Negative evidence.
-        if pressure_weakening:
-            score -= 8
-            reasons.append("buy pressure weakening")
-        if volume_fading and not recovery:
-            score -= 5
-            reasons.append("volume fading")
-        if gain_pct < -3.0 and not stabilization:
-            score -= 10
-            reasons.append("uncontrolled decline")
-        if extended:
-            score -= 8
-            reasons.append("already extended")
-        if overextended:
-            score -= 12
-
-        score = max(0, min(100, int(score)))
-        pattern = max(pattern_points, key=pattern_points.get)
-        if pattern_points[pattern] <= 0:
-            return None
-
-        # A candidate must show preparation, not simply volume.
-        valid_setup = (
-            volume_strong
-            and no_new_low
-            and (
-                stabilization
-                or compression
-                or recovery
-                or (near_resistance and pressure_rising)
-            )
-            and buying_pressure >= 0.50
-            and not overextended
-        )
-        if not valid_setup or score < 55:
-            return None
-
-        if recovery and stabilization:
-            pattern = "ABSORPTION → RECOVERY"
-        elif compression and recovery:
-            pattern = "COMPRESSION → RECOVERY"
-
-        if score >= 80:
-            recommendation = "BTST CANDIDATE"
-            status = "🟢 BTST CANDIDATE"
-        elif score >= 65:
-            recommendation = "BTST WATCH"
-            status = "🟡 BTST WATCH"
-        else:
-            recommendation = "BTST EARLY"
-            status = "⚪ BTST EARLY"
-
-        return {
-            "symbol": symbol,
-            "score": score,
-            "recommendation": recommendation,
-            "status": status,
-            "ltp": round(ltp, 2),
-            "gain": round(gain_pct, 2),
-            "position_52w_pct": round(position_52w_pct, 2),
-            "buy": round(buying_pressure * 100, 2),
-            "sell": round((1.0 - buying_pressure) * 100, 2),
-            "vol": round(rvol_pace, 2),
-            "turnover": round(turnover_pace, 2),
-            "close_pos": round(close_position, 1),
-            "day_range": round((day_high - day_low) / previous_close * 100.0, 2),
-            "resistance": round(nearest_resistance, 2),
-            "distance": round(distance_to_resistance, 2),
-            "price_stable": stabilization,
-            "price_rising_60s": price_rising_60,
-            "price_rising_180s": price_rising_180,
+            "vol": round(volume_ratio, 2),
+            "buy": round(buying_pressure * 100.0, 2),
+            "price_change_5m": round(change_5m, 2),
+            "price_change_15m": round(change_15m, 2),
+            "volume_baseline": volume_baseline,
+            "volume_baseline_days": profile_days,
+            "expected_volume": int(expected_volume),
+            "price_stable": live_settling_score >= 9,
             "no_new_low": no_new_low,
-            "soft_new_low": soft_new_low,
-            "hard_new_low": hard_new_low,
-            "distance_from_low_pct": round(distance_from_low_pct, 2),
             "higher_low": higher_low,
-            "recovery": recovery,
-            "compression": compression,
-            "pressure_rising": pressure_rising,
-            "pattern": pattern,
-            "historical_score": min(21, 10 + (6 if float(past_data.get("close_compression_5d_pct", 999) or 999) <= 3.0 else 0) + (5 if past_data.get("higher_low_structure", False) else 0)),
-            "reason": "; ".join(reasons)[:700],
-            "priority": 3 if score >= 80 else (2 if score >= 65 else 1),
+            "pressure_rising": pressure_delta >= 0.05,
+            "price_rising_60s": change_pct(window(60)) > 0,
+            "price_rising_180s": change_pct(window(180)) > 0,
+            "historical_month_change": round(month_change, 2),
+            "historical_5d_change": round(five_day_change, 2),
+            "settled_days": stable_days,
+            "intraday_range_30m_pct": round(recent_range_30, 3),
+            "breakout_persistent": False,
         }
 
+    def evaluate_live_breakout(self, symbol, past_data, cs):
+        """Compatibility alias to the unified stock rating evaluator."""
+        return self.evaluate_unified_candidate(symbol, past_data, cs)
+    def evaluate_btst_candidate(self, symbol, past_data, cs):
+        """Compatibility alias to the unified stock rating evaluator."""
+        return self.evaluate_unified_candidate(symbol, past_data, cs)
     def analyze_tick_metrics(self, token: str, msg: dict) -> dict:
         """
         Parse an Angel One FULL-mode tick and calculate live metrics.
@@ -2451,17 +2059,11 @@ class NSEHighPerformanceTradingPipeline:
         raw_high = msg.get("high_price_of_the_day", 0)
         raw_low = msg.get("low_price_of_the_day", 0)
 
-        # 52-week range supplied by Angel One FULL-mode market data.
-        raw_52w_high = msg.get("52_week_high_price", 0)
-        raw_52w_low = msg.get("52_week_low_price", 0)
-
         ltp = _price(raw_ltp)
         last_closed_price = _price(raw_close)
         open_price = _price(raw_open)
         day_high = _price(raw_high)
         day_low = _price(raw_low)
-        week_52_high = _price(raw_52w_high)
-        week_52_low = _price(raw_52w_low)
 
         current_volume = int(
             _number(
@@ -2662,17 +2264,6 @@ class NSEHighPerformanceTradingPipeline:
             else 0.0
         )
 
-        # Position inside the Angel One 52-week range.
-        # 0% = 52W low, 100% = 52W high.
-        # This is exposed to the BTST engine as context/filter data.
-        position_52w_pct = (
-            (ltp - week_52_low)
-            / (week_52_high - week_52_low)
-            * 100.0
-            if week_52_high > week_52_low > 0
-            else None
-        )
-
         # ---------------------------------------------------------------
         # TODAY INTRADAY HISTORY FOR LOCAL UI POPUP
         # ---------------------------------------------------------------
@@ -2732,13 +2323,6 @@ class NSEHighPerformanceTradingPipeline:
             "open_price": round(open_price, 2),
             "day_high": round(day_high, 2),
             "day_low": round(day_low, 2),
-            "52_week_high": round(week_52_high, 2),
-            "52_week_low": round(week_52_low, 2),
-            "position_52w_pct": (
-                round(position_52w_pct, 2)
-                if position_52w_pct is not None
-                else None
-            ),
             "current_volume": current_volume,
             "current_turnover": round(
                 current_turnover,
