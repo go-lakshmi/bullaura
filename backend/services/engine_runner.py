@@ -58,7 +58,7 @@ def _run_original_pipeline():
 
 
 def _snapshot_loop():
-    """Build and publish the latest local-UI snapshot continuously (about once per second).
+    """Build and publish the latest local-UI snapshot every 10 seconds.
 
     The Angel One engine keeps updating live state continuously. This thread
     publishes a point-in-time snapshot frequently so the web dashboard sees
@@ -66,7 +66,7 @@ def _snapshot_loop():
     """
     from backend.services.live_data import build_snapshot
 
-    interval = 5.0
+    interval = 10.0
     next_publish = time.monotonic() + interval
     batch_no = 0
 
@@ -86,7 +86,7 @@ def _snapshot_loop():
 
                 published = state.set_snapshot(snapshot, force=True)
                 log.debug(
-                    "LOCAL UI 1s snapshot #%d | collected=%d | published=%s | build=%.2fs",
+                    "LOCAL UI 10s snapshot #%d | collected=%d | published=%s | build=%.2fs",
                     batch_no, len(stocks), published, build_seconds
                 )
 

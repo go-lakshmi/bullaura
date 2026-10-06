@@ -19,6 +19,7 @@ from nselib import capital_market
 from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 from backend.config.logger import logger as log
+from backend.services.fundamentals_filter import add_debt_to_equity_and_filter
 
 
 class NSEHighPerformanceTradingPipeline:
@@ -87,8 +88,8 @@ class NSEHighPerformanceTradingPipeline:
         cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
 
-        # v6 invalidates the old 45-day cache without the 52-week cutoff.
-        cache_version = "nse_live_volume_shocker_v6"
+        # v8 applies the 50% 52-week position cutoff.
+        cache_version = "nse_live_volume_shocker_v8"
 
         # ------------------------------------------------------------------
         # CACHE
@@ -428,10 +429,10 @@ class NSEHighPerformanceTradingPipeline:
                     / week_52_range
                     * 100.0
                 )
-                if position_52w_pct < 30.0:
+                if position_52w_pct < 50.0:
                     increment_counter("low_52week_position")
                     log.info(
-                        "NSE REJECT | %s | reason=52_WEEK_POSITION_BELOW_30%% | "
+                        "NSE REJECT | %s | reason=52_WEEK_POSITION_BELOW_50%% | "
                         "position=%.2f%% | close=%.2f | low=%.2f | high=%.2f",
                         symbol,
                         position_52w_pct,
@@ -1063,8 +1064,20 @@ class NSEHighPerformanceTradingPipeline:
                 time.sleep(0.1)
 
         # ==============================================================
-        # STORE RESULTS
+        # DAILY FUNDAMENTALS SCREEN
         # ==============================================================
+
+        results, fundamentals_counts = add_debt_to_equity_and_filter(results)
+
+        log.info(
+            "FUNDAMENTALS FILTER COMPLETE | passed=%d | rejected=%d | unknown_kept=%d",
+            fundamentals_counts["passed"],
+            fundamentals_counts["rejected"],
+            fundamentals_counts["unknown"],
+        )
+
+        # STORE RESULTS
+        # ============================================================== 
 
         self.volume_shockers = results
 
@@ -1121,7 +1134,7 @@ class NSEHighPerformanceTradingPipeline:
         )
 
         log.info(
-            "52-week position < 30%%       : %d",
+            "52-week position < 50%%       : %d",
             filter_counts["low_52week_position"],
         )
 

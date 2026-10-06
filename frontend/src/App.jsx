@@ -40,11 +40,43 @@ export default function App() {
 
   const stocks = useMemo(
     () =>
-      data.stocks.filter(
-        (s) =>
-          !q ||
-          String(s.symbol || "").toLowerCase().includes(q.toLowerCase())
-      ),
+      data.stocks
+        .filter(
+          (s) =>
+            !q ||
+            String(s.symbol || "").toLowerCase().includes(q.toLowerCase())
+        )
+        .map((stock, index) => ({ stock, index }))
+        .sort((a, b) => {
+          const priorityStatus = (stock) => {
+            return [stock.status, stock.category, stock.recommendation].some(
+              (candidate) => {
+                const value = String(candidate || "")
+                  .toUpperCase()
+                  .replace(/^[^A-Z]*/, "")
+                  .trim();
+                return value === "BUY" || value === "BREAK";
+              }
+            );
+          };
+
+          const aPriority = priorityStatus(a.stock);
+          const bPriority = priorityStatus(b.stock);
+          if (aPriority !== bPriority) return aPriority ? -1 : 1;
+
+          // Keep BUY/BREAK in their incoming order. Sort other stocks by gain,
+          // then RVOL, so status promotion is independent of those values.
+          if (aPriority) return a.index - b.index;
+
+          const gainDifference =
+            Number(b.stock.gain ?? 0) - Number(a.stock.gain ?? 0);
+          if (gainDifference !== 0) return gainDifference;
+
+          const rvolDifference =
+            Number(b.stock.rvol ?? 0) - Number(a.stock.rvol ?? 0);
+          return rvolDifference || a.index - b.index;
+        })
+        .map(({ stock }) => stock),
     [data.stocks, q]
   );
 
