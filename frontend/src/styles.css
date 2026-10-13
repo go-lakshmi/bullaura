@@ -33,3 +33,10 @@
 
 /* Intraday popup: actual minute spacing from 09:15 to the latest available minute. */
 .todayPopup .recharts-wrapper,.todayPopup .recharts-surface{overflow:visible}
+
+.priceChartHeading{display:flex;align-items:center;justify-content:space-between;margin:7px 0 1px}.priceChartHeading label{margin:0}.priceChartLegend{display:flex;gap:7px;color:#7c8490;font-size:7px;line-height:1}.priceChartLegend span{display:flex;align-items:center;gap:2px}.priceChartLegend i{display:inline-block;width:7px;height:2px;border-radius:2px}.priceChartLegend .legendAverage5{background:#f59e0b}.priceChartLegend .legendAverage10{background:#8b5cf6}
+.cardTop .ltpIndicatorBadge{display:inline-flex;align-items:center;justify-content:center;min-width:16px;height:14px;padding:0 4px;margin:0 0 0 3px;border:1px solid currentColor;border-radius:999px;font:700 7px/1 Inter,system-ui,sans-serif;vertical-align:middle}
+.cardTop .ltpBadge5d{color:#16a34a;background:#f0fdf4}
+.cardTop .ltpBadgeMacd{color:#2563eb;background:#eff6ff}
+.cardTop .ltpBadgeRsi{color:#dc2626;background:#fef2f2}
+.priceChartExpand{border:0;background:transparent;color:#64748b;font-size:10px;line-height:1;padding:0 1px;cursor:pointer}.priceChartExpand:hover{color:#2563eb}.priceDetailBackdrop{position:fixed;inset:0;z-index:2000;display:flex;align-items:center;justify-content:center;padding:16px;background:rgba(15,23,42,.46)}.priceDetailDialog{width:min(960px,96vw);height:min(560px,86vh);background:#fff;border-radius:14px;box-shadow:0 18px 60px rgba(15,23,42,.28);padding:16px;display:flex;flex-direction:column}.priceDetailHeader{display:flex;align-items:center;justify-content:space-between;color:#172033;font-size:14px}.priceDetailHeader span{color:#7c8490;font-size:11px}.priceDetailHeader button{width:30px;height:30px;border:1px solid #e0e4ea;border-radius:50%;background:#fff;color:#475569;font-size:20px;line-height:1;cursor:pointer}.priceDetailChart{flex:1;min-height:0;margin-top:12px}

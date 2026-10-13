@@ -22,6 +22,80 @@ from backend.config.logger import logger as log
 from backend.services.fundamentals_filter import add_debt_to_equity_and_filter
 
 
+def _build_daily_indicator_seed(closes_oldest_first, min_history=50):
+    """Build the previous-session EMA and Wilder RSI state for live updates."""
+    closes = []
+    for value in closes_oldest_first or []:
+        try:
+            close = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(close) and close > 0:
+            closes.append(close)
+
+    if len(closes) < min_history:
+        return None
+
+    alpha12 = 2.0 / 13.0
+    alpha26 = 2.0 / 27.0
+    alpha9 = 2.0 / 10.0
+    ema12 = ema26 = closes[0]
+    signal = 0.0
+    for index, close in enumerate(closes):
+        if index:
+            ema12 += alpha12 * (close - ema12)
+            ema26 += alpha26 * (close - ema26)
+        macd = ema12 - ema26
+        signal = macd if index == 0 else signal + alpha9 * (macd - signal)
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    if len(deltas) < 14:
+        return None
+    average_gain = sum(max(delta, 0.0) for delta in deltas[:14]) / 14.0
+    average_loss = sum(max(-delta, 0.0) for delta in deltas[:14]) / 14.0
+    for delta in deltas[14:]:
+        average_gain = (average_gain * 13.0 + max(delta, 0.0)) / 14.0
+        average_loss = (average_loss * 13.0 + max(-delta, 0.0)) / 14.0
+
+    return {
+        "previous_close": closes[-1],
+        "ema12": ema12,
+        "ema26": ema26,
+        "macd_signal": signal,
+        "average_gain_14": average_gain,
+        "average_loss_14": average_loss,
+    }
+
+
+def _provisional_daily_indicators(seed, live_ltp):
+    """Calculate today's provisional daily MACD/RSI without compounding ticks."""
+    if not seed or live_ltp <= 0:
+        return {}
+
+    change = live_ltp - seed["previous_close"]
+    ema12 = seed["ema12"] + (2.0 / 13.0) * (live_ltp - seed["ema12"])
+    ema26 = seed["ema26"] + (2.0 / 27.0) * (live_ltp - seed["ema26"])
+    macd = ema12 - ema26
+    signal = seed["macd_signal"] + (2.0 / 10.0) * (macd - seed["macd_signal"])
+
+    average_gain = (seed["average_gain_14"] * 13.0 + max(change, 0.0)) / 14.0
+    average_loss = (seed["average_loss_14"] * 13.0 + max(-change, 0.0)) / 14.0
+    rsi = (
+        50.0
+        if average_gain == 0 and average_loss == 0
+        else 100.0
+        if average_loss == 0
+        else 100.0 - 100.0 / (1.0 + average_gain / average_loss)
+    )
+
+    return {
+        "daily_macd": round(macd, 4),
+        "daily_macd_signal": round(signal, 4),
+        "daily_macd_histogram": round(macd - signal, 4),
+        "daily_rsi": round(rsi, 2),
+    }
+
+
 class NSEHighPerformanceTradingPipeline:
 
     def __init__(self, broker, instrument_master, config_path="data/trades_config.json", strategy_conf_path="data/conf.json", portfolio_tracker=None):
@@ -88,8 +162,8 @@ class NSEHighPerformanceTradingPipeline:
         cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
 
-        # v8 applies the 50% 52-week position cutoff.
-        cache_version = "nse_live_volume_shocker_v8"
+        # v9 retains extended daily close history for MACD/RSI calculations.
+        cache_version = "nse_live_volume_shocker_v9"
 
         # ------------------------------------------------------------------
         # CACHE
@@ -441,6 +515,15 @@ class NSEHighPerformanceTradingPipeline:
                         week_52_high,
                     )
                     return symbol, None
+
+                # Preserve a longer close history for daily MACD/RSI while
+                # keeping the existing 22-session filter payload unchanged.
+                indicator_closes_oldest_first = [
+                    float(value)
+                    for value in df["ClosePrice"].head(100).tolist()
+                    if pd.notna(value) and float(value) > 0
+                ][::-1]
+                indicator_history_last_date = df.iloc[0]["Date"].strftime("%Y-%m-%d")
 
                 # Keep the existing short-term filters and NSE payload
                 # limited to the latest 22 completed sessions.
@@ -973,6 +1056,8 @@ class NSEHighPerformanceTradingPipeline:
 
                     # ALL 22 NSE records.
                     "nse_data": records,
+                    "indicator_closes_oldest_first": indicator_closes_oldest_first,
+                    "indicator_history_last_date": indicator_history_last_date,
                 }
 
             except Exception as ex:
@@ -1781,6 +1866,26 @@ class NSEHighPerformanceTradingPipeline:
             except (TypeError, ValueError):
                 continue
 
+        indicator_closes = past_data.get("indicator_closes_oldest_first")
+        if not indicator_closes:
+            # Older on-disk caches may not have the extended indicator history.
+            indicator_closes = [row["close"] for row in reversed(rows)]
+        indicator_history_date = str(
+            past_data.get("indicator_history_last_date")
+            or ((records[0].get("Date") if records else "") or "")
+        )[:10]
+        indicator_seed_cache = cache.get("daily_indicator_seed") or {}
+        if indicator_seed_cache.get("history_date") != indicator_history_date:
+            indicator_seed_cache = {
+                "history_date": indicator_history_date,
+                "state": _build_daily_indicator_seed(indicator_closes),
+            }
+            cache["daily_indicator_seed"] = indicator_seed_cache
+        daily_indicators = _provisional_daily_indicators(
+            indicator_seed_cache.get("state"),
+            ltp,
+        )
+
         month_change = 0.0
         five_day_change = 0.0
         if len(rows) >= 2:
@@ -1977,6 +2082,7 @@ class NSEHighPerformanceTradingPipeline:
             "price_rising_180s": change_pct(window(180)) > 0,
             "historical_month_change": round(month_change, 2),
             "historical_5d_change": round(five_day_change, 2),
+            **daily_indicators,
             "settled_days": stable_days,
             "intraday_range_30m_pct": round(recent_range_30, 3),
             "breakout_persistent": False,

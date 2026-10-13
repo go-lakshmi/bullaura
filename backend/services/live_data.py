@@ -1,5 +1,5 @@
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 
@@ -14,13 +14,13 @@ def build_snapshot(engine):
     """
     Build the local-UI snapshot.
 
-    Chart data is one month of completed NSE sessions plus ONE current-day
-    point from Angel One.  The current NSE row is deliberately excluded from
-    the historical series so the live LTP/current volume come only from
-    Angel One during the session.
+    Chart data covers the current day and prior 30 calendar days of completed
+    NSE sessions plus one current-day point from Angel One. The current NSE
+    row is excluded so live LTP/current volume come only from Angel One.
     """
     stocks_by_symbol = {}
     today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    chart_start_date = today - timedelta(days=30)
 
     for token, cache in getattr(engine, "live_cache", {}).items():
         symbol = str(cache.get("symbol", "") or "").strip()
@@ -36,14 +36,16 @@ def build_snapshot(engine):
         # ---------------------------------------------------------------
         # NSE stores the latest row first.  Use completed sessions only;
         # if NSE already contains today's row, exclude it because today's
-        # LTP and cumulative volume must come from Angel One.
+        # LTP and cumulative volume must come from Angel One. Keep only the
+        # rolling 30-calendar-day window to align with a one-month chart.
         nse_records = past.get("nse_data") or []
         historical_price = []
         historical_volume = []
 
-        # nse_data is newest-first. Build completed-session rows once so
-        # averages and chart history use the same D-1.. historical baseline.
+        # nse_data is newest-first. Keep all completed rows for rolling
+        # volume averages, and a date-limited subset for the month charts.
         completed_rows = []
+        chart_rows = []
         for row in nse_records:
             raw_date = row.get("Date")
             try:
@@ -54,6 +56,8 @@ def build_snapshot(engine):
                 continue
             if row_date < today:
                 completed_rows.append((row_date, row))
+                if row_date >= chart_start_date:
+                    chart_rows.append((row_date, row))
 
         def avg_completed_volume(days):
             values = [
@@ -68,7 +72,7 @@ def build_snapshot(engine):
         avg_volume_15 = avg_completed_volume(15)
         avg_volume_20 = avg_completed_volume(20)
 
-        for row_date, row in reversed(completed_rows):
+        for row_date, row in reversed(chart_rows):
             close = _num(row.get("ClosePrice"))
             volume = _num(row.get("TotalTradedQuantity"))
             if close > 0:
@@ -103,8 +107,8 @@ def build_snapshot(engine):
             "value": current_volume,
         })
 
-        price_history = historical_price[-31:]
-        volume_history = historical_volume[-31:]
+        price_history = historical_price
+        volume_history = historical_volume
 
         # ---------------------------------------------------------------
         # TODAY'S INTRADAY DATA FOR THE STATUS-HOVER POPUP
@@ -195,6 +199,9 @@ def build_snapshot(engine):
             "symbol": symbol,
             "token": str(token),
             "ltp": current_ltp,
+            "last_5_avg_daily_move": past.get("last_5_avg_daily_move"),
+            "daily_macd": signal.get("daily_macd"),
+            "daily_rsi": signal.get("daily_rsi"),
             "gain": gain_pct,
             "rvol": _num(signal.get("vol")),
             "buying_pressure": _num(cs.get("buying_pressure"), 0.5),
