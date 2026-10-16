@@ -6,6 +6,7 @@ import math
 import yfinance as yf
 
 from backend.config.logger import logger as log
+from backend.services.sector_strength import sector_index_for
 
 
 DEBT_TO_EQUITY_LIMIT = 1.0
@@ -23,24 +24,29 @@ def add_debt_to_equity_and_filter(stocks, max_workers=4):
     if not stocks:
         return {}, {"passed": 0, "rejected": 0, "unknown": 0}
 
-    def fetch_ratio(symbol):
+    def fetch_fundamentals(symbol):
         ticker_symbol = f"{symbol}.NS"
         try:
-            raw_value = yf.Ticker(ticker_symbol).info.get("debtToEquity")
+            info = yf.Ticker(ticker_symbol).info
+            raw_value = info.get("debtToEquity")
+            sector = info.get("sector")
+            industry = info.get("industry")
             if raw_value is None:
-                return symbol, None, "missing"
+                return symbol, None, sector, industry, "missing"
 
             percentage = float(raw_value)
             if not math.isfinite(percentage) or percentage < 0:
-                return symbol, None, "invalid"
+                return symbol, None, sector, industry, "invalid"
 
             return (
                 symbol,
                 percentage / YAHOO_DEBT_TO_EQUITY_PERCENT_DIVISOR,
+                sector,
+                industry,
                 "ok",
             )
         except Exception as exc:
-            return symbol, None, f"error: {exc}"
+            return symbol, None, None, None, f"error: {exc}"
 
     screened = {}
     rejected = 0
@@ -48,15 +54,17 @@ def add_debt_to_equity_and_filter(stocks, max_workers=4):
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_symbol = {
-            executor.submit(fetch_ratio, symbol): symbol for symbol in stocks
+            executor.submit(fetch_fundamentals, symbol): symbol for symbol in stocks
         }
 
         for future in as_completed(future_to_symbol):
             symbol = future_to_symbol[future]
             try:
-                returned_symbol, ratio, status = future.result()
+                returned_symbol, ratio, sector, industry, status = future.result()
             except Exception:
-                returned_symbol, ratio, status = symbol, None, "error: worker failed"
+                returned_symbol, ratio, sector, industry, status = (
+                    symbol, None, None, None, "error: worker failed"
+                )
 
             if status != "ok":
                 unknown += 1
@@ -78,6 +86,9 @@ def add_debt_to_equity_and_filter(stocks, max_workers=4):
 
             stock = dict(stocks[returned_symbol])
             stock["debt_to_equity"] = round(ratio, 6) if ratio is not None else None
+            stock["company_sector"] = str(sector).strip() if sector else None
+            stock["company_industry"] = str(industry).strip() if industry else None
+            stock["sector_index_symbol"] = sector_index_for(sector, industry)
             screened[returned_symbol] = stock
 
             if ratio is not None:

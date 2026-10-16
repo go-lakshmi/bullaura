@@ -64,17 +64,30 @@ export default function App() {
           const bPriority = priorityStatus(b.stock);
           if (aPriority !== bPriority) return aPriority ? -1 : 1;
 
-          // Keep BUY/BREAK in their incoming order. Sort other stocks by gain,
-          // then RVOL, so status promotion is independent of those values.
-          if (aPriority) return a.index - b.index;
+          // Promote BUY/BREAK first, then sort by stock gain.
+          if (aPriority !== bPriority) return aPriority ? -1 : 1;
 
           const gainDifference =
             Number(b.stock.gain ?? 0) - Number(a.stock.gain ?? 0);
           if (gainDifference !== 0) return gainDifference;
 
-          const rvolDifference =
-            Number(b.stock.rvol ?? 0) - Number(a.stock.rvol ?? 0);
-          return rvolDifference || a.index - b.index;
+          const sectorAdjustmentDifference =
+            Number(b.stock.sector_rating_adjustment ?? 0) -
+            Number(a.stock.sector_rating_adjustment ?? 0);
+          if (sectorAdjustmentDifference !== 0) return sectorAdjustmentDifference;
+
+          const aSectorFiveDay = Number(a.stock.sector_index_5d_change_pct);
+          const bSectorFiveDay = Number(b.stock.sector_index_5d_change_pct);
+          const aHasSectorFiveDay = Number.isFinite(aSectorFiveDay);
+          const bHasSectorFiveDay = Number.isFinite(bSectorFiveDay);
+          if (aHasSectorFiveDay !== bHasSectorFiveDay) {
+            return aHasSectorFiveDay ? -1 : 1;
+          }
+          if (aHasSectorFiveDay && bSectorFiveDay !== aSectorFiveDay) {
+            return bSectorFiveDay - aSectorFiveDay;
+          }
+
+          return a.index - b.index;
         })
         .map(({ stock }) => stock),
     [data.stocks, q]
@@ -101,22 +114,28 @@ export default function App() {
         <button onClick={() => setMode("cards")} className={mode === "cards" ? "active" : ""}>
           Cards
         </button>
+        <button onClick={() => setMode("cards2")} className={mode === "cards2" ? "active" : ""}>
+          Cards 2 (101–300)
+        </button>
         <button onClick={() => setMode("table")} className={mode === "table" ? "active" : ""}>
           Table
         </button>
       </div>
 
-      {mode === "cards" ? (
+      {mode === "cards" || mode === "cards2" ? (
         <main className="grid">
-          {stocks.map((s) => <StockCard key={s.symbol} stock={s} />)}
-          {!stocks.length && (
+          {(mode === "cards" ? stocks.slice(0, 100) : stocks.slice(100, 300)).map((s) => <StockCard key={s.symbol} stock={s} />)}
+          {!stocks.length && mode === "cards" && (
             <div className="empty">
               The UI is ready. Start the configured Python engine to populate live stocks.
             </div>
           )}
+          {mode === "cards2" && stocks.length <= 100 && (
+            <div className="empty">No stocks ranked 101–300 are available right now.</div>
+          )}
         </main>
       ) : (
-        <StockTable stocks={stocks} />
+        <StockTable stocks={stocks.slice(0, 100)} />
       )}
     </div>
   );

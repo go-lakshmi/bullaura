@@ -87,6 +87,27 @@ export default function StockCard({ stock }) {
         {showToday && <TodayPopup stock={stock} />}
       </div>
 
+      {stock.company_sector && (
+        <div className="sectorSummary" title={`${stock.company_industry || stock.company_sector}${stock.sector_index ? ` · ${stock.sector_index}` : ""}${stock.sector_vs_nifty_5d_pct == null ? "" : ` · five-session sector performance versus Nifty ${Number(stock.sector_vs_nifty_5d_pct) > 0 ? "+" : ""}${Number(stock.sector_vs_nifty_5d_pct).toFixed(2)}%`}${Number(stock.sector_rating_adjustment || 0) ? ` · sector rating adjustment ${Number(stock.sector_rating_adjustment) > 0 ? "+" : ""}${Number(stock.sector_rating_adjustment)}` : ""}`}>
+          <span>{stock.company_sector}</span>
+          {stock.sector_index_daily_change_pct !== null && stock.sector_index_daily_change_pct !== undefined && (
+            <b className={Number(stock.sector_index_daily_change_pct) >= 0 ? "up" : "down"}>
+              {Number(stock.sector_index_daily_change_pct) > 0 ? "+" : ""}{Number(stock.sector_index_daily_change_pct).toFixed(2)}% T
+            </b>
+          )}
+          {stock.sector_index_5d_change_pct !== null && stock.sector_index_5d_change_pct !== undefined && (
+            <small className={Number(stock.sector_index_5d_change_pct) >= 0 ? "up" : "down"}>
+              {Number(stock.sector_index_5d_change_pct) > 0 ? "+" : ""}{Number(stock.sector_index_5d_change_pct).toFixed(2)}% 5D
+            </small>
+          )}
+          {Number(stock.sector_rating_adjustment || 0) !== 0 && (
+            <small className={Number(stock.sector_rating_adjustment) > 0 ? "up" : "down"}>
+              {Number(stock.sector_rating_adjustment) > 0 ? "+" : ""}{Number(stock.sector_rating_adjustment)}
+            </small>
+          )}
+        </div>
+      )}
+
       <div className="priceChartHeading">
         <label>PRICE</label>
         <div className="priceChartLegend" aria-label="Price graph lines">

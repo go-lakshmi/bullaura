@@ -20,6 +20,11 @@ from SmartApi.smartWebSocketV2 import SmartWebSocketV2
 
 from backend.config.logger import logger as log
 from backend.services.fundamentals_filter import add_debt_to_equity_and_filter
+from backend.services.sector_strength import (
+    normalize_index_symbol,
+    sector_index_for,
+    sector_rating_adjustment,
+)
 
 
 def _build_daily_indicator_seed(closes_oldest_first, min_history=50):
@@ -121,6 +126,11 @@ class NSEHighPerformanceTradingPipeline:
         self.settings = {}
         self.scrip_master_data = None
         self.volume_shockers = {}
+        self.sector_index_by_token = {}
+        self.sector_index_live_data = {}
+        self.sector_index_history_path = Path("data/sector_index_history.json")
+        self.sector_index_history = self._load_sector_index_history()
+        self._sector_history_refresh_started = False
         self.volume_profile_path = Path("data/intraday_volume_profiles.json")
         self.intraday_volume_profiles = self._load_intraday_volume_profiles()
         self._volume_profile_last_save = 0.0
@@ -162,8 +172,8 @@ class NSEHighPerformanceTradingPipeline:
         cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
 
-        # v9 retains extended daily close history for MACD/RSI calculations.
-        cache_version = "nse_live_volume_shocker_v9"
+        # v10 adds Yahoo sector/industry fields to the daily candidate cache.
+        cache_version = "nse_live_volume_shocker_v10"
 
         # ------------------------------------------------------------------
         # CACHE
@@ -1446,7 +1456,7 @@ class NSEHighPerformanceTradingPipeline:
         # threading.Thread(target=self.run_continuous_funnel_loop, daemon=True).start()
 
     def subscribe_filtered_stocks(self):
-        """Extracts stock symbols from self.volume_shockers, maps them to tokens, and subscribes via WebSocket."""
+        """Subscribe to selected NSE stocks and only their needed index feeds."""
         target_tokens = []
         self.tick_unmapped_symbols = []
         
@@ -1522,15 +1532,100 @@ class NSEHighPerformanceTradingPipeline:
                 ",".join(self.tick_unmapped_symbols),
             )
 
-        # 2) Connect and subscribe to WebSocket channels for each stock data
+        required_index_names = {"Nifty 50"}
+        for symbol in volume_shocker_symbols:
+            stock = self.volume_shockers.get(symbol, {}) or {}
+            sector_name = stock.get("sector_index_symbol") or sector_index_for(
+                stock.get("company_sector"), stock.get("company_industry")
+            )
+            if sector_name:
+                required_index_names.add(sector_name)
+
+        found_indexes = {}
+        for item in self.scrip_master_data or []:
+            inst = item.get("raw_instrument", item) if isinstance(item, dict) else item
+            if not isinstance(inst, dict):
+                continue
+            if inst.get("exch_seg") != "NSE" or inst.get("instrumenttype") != "AMXIDX":
+                continue
+            index_key = normalize_index_symbol(inst.get("symbol"))
+            for wanted in required_index_names:
+                if index_key == normalize_index_symbol(wanted):
+                    token = str(inst.get("token", "")).strip()
+                    if not token:
+                        continue
+                    found_indexes[wanted] = token
+                    self.sector_index_by_token[token] = wanted
+                    if token not in target_tokens:
+                        target_tokens.append(token)
+                    index_label = wanted
+                    if token not in self.live_cache:
+                        self.live_cache[token] = {
+                            "symbol": index_label,
+                            "ticks": [],
+                            "live_samples": deque(maxlen=1800),
+                        }
+                    with self.tick_stats_lock:
+                        self.tick_stats_by_token.setdefault(
+                            token,
+                            {
+                                "symbol": index_label,
+                                "received": 0,
+                                "evaluated": 0,
+                                "skipped": 0,
+                                "failed": 0,
+                                "last_received_at": None,
+                                "last_processed_at": None,
+                                "last_status": "awaiting_tick",
+                                "last_skip_reason": "",
+                                "subscription_requested": False,
+                            },
+                        )
+
+        missing_indexes = sorted(required_index_names - set(found_indexes))
+        if missing_indexes:
+            log.warning(
+                "SECTOR INDEX TOKEN MISSING | count=%d | indexes=%s",
+                len(missing_indexes),
+                ",".join(missing_indexes),
+            )
+        if not self._sector_history_refresh_started:
+            self._sector_history_refresh_started = True
+            threading.Thread(
+                target=self._refresh_sector_index_history,
+                name="sector-index-history-refresh",
+                daemon=True,
+            ).start()
+
+        stock_tokens = [token for token in target_tokens if token not in self.sector_index_by_token]
+        index_tokens = [token for token in target_tokens if token in self.sector_index_by_token]
+
+        # 2) Stocks use FULL mode for their depth metrics; index feeds only
+        # need quote mode for LTP and previous-close comparisons.
         if target_tokens and self.sws and self.sws.wsapp and self.sws.wsapp.sock and self.sws.wsapp.sock.connected:
-            self.sws.subscribe(correlation_id="volume_shockers_sync", mode=3, token_list=[{"exchangeType": 1, "tokens": target_tokens}])
+            if stock_tokens:
+                self.sws.subscribe(
+                    correlation_id="volume_shockers_sync",
+                    mode=3,
+                    token_list=[{"exchangeType": 1, "tokens": stock_tokens}],
+                )
+            if index_tokens:
+                self.sws.subscribe(
+                    correlation_id="sector_indexes_sync",
+                    mode=2,
+                    token_list=[{"exchangeType": 1, "tokens": index_tokens}],
+                )
             self.active_stream_tokens.update(target_tokens)
             with self.tick_stats_lock:
                 for token in target_tokens:
                     if token in self.tick_stats_by_token:
                         self.tick_stats_by_token[token]["subscription_requested"] = True
-            log.info(f"Successfully subscribed to {len(target_tokens)} tokens from self.volume_shockers.")
+            log.info(
+                "Angel One subscriptions requested | stocks=%d | sector_indexes=%d | total_tokens=%d",
+                len(mapped_symbols),
+                len(found_indexes),
+                len(target_tokens),
+            )
 
 
     def run_continuous_funnel_loop(self):
@@ -1551,6 +1646,24 @@ class NSEHighPerformanceTradingPipeline:
                 for msg in pending_messages:
                     try:
                         token = str(msg.get("token", ""))
+                        if token in self.sector_index_by_token:
+                            index_name = self.sector_index_by_token[token]
+                            index_metrics = self.analyze_tick_metrics(token, msg)
+                            self.live_cache[token]["symbol"] = index_name
+                            index_previous_close = index_metrics.get("last_closed_price", 0)
+                            self.sector_index_live_data[index_name] = {
+                                "daily_change_pct": (
+                                    index_metrics.get("gain_pct")
+                                    if index_previous_close and index_previous_close > 0
+                                    else None
+                                ),
+                                "ltp": index_metrics.get("ltp"),
+                                "previous_close": index_previous_close,
+                                "updated_at": time.time(),
+                            }
+                            self._record_tick_status("evaluated", token)
+                            continue
+
                         cache = self.live_cache.get(token)
                         if not cache:
                             self._record_tick_status("skipped", token, "no_live_cache")
@@ -1646,6 +1759,12 @@ class NSEHighPerformanceTradingPipeline:
         subscribed_tokens = [
             token for token, details in stocks.items()
             if details.get("subscription_requested")
+            and token not in self.sector_index_by_token
+        ]
+        subscribed_index_tokens = [
+            token for token, details in stocks.items()
+            if details.get("subscription_requested")
+            and token in self.sector_index_by_token
         ]
         subscribed_symbols = sorted({
             stocks[token].get("symbol", "") for token in subscribed_tokens
@@ -1658,8 +1777,16 @@ class NSEHighPerformanceTradingPipeline:
             "historical_candidate_count": len(self.volume_shockers),
             "subscription_requested_token_count": len(subscribed_tokens),
             "subscription_requested_symbol_count": len(subscribed_symbols),
+            "sector_index_subscription_requested_count": len(subscribed_index_tokens),
             "symbols_without_token": list(self.tick_unmapped_symbols),
-            "stocks": stocks,
+            "stocks": {
+                token: details for token, details in stocks.items()
+                if token not in self.sector_index_by_token
+            },
+            "sector_indexes": {
+                token: details for token, details in stocks.items()
+                if token in self.sector_index_by_token
+            },
         }
 
     def _update_ui_state(self, symbol, token, cs, signal, past_data):
@@ -1730,6 +1857,105 @@ class NSEHighPerformanceTradingPipeline:
         except Exception:
             log.exception("Could not load saved intraday volume profiles")
             return {}
+
+    def _load_sector_index_history(self):
+        """Load the latest once-daily sector-index candles used for scoring."""
+        try:
+            with self.sector_index_history_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else {}
+        except FileNotFoundError:
+            return {}
+        except Exception:
+            log.exception("Could not load cached sector-index history")
+            return {}
+
+    def _refresh_sector_index_history(self):
+        """Fetch index candles once per session; a failure leaves scoring neutral."""
+        today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        today_text = today.isoformat()
+        index_names = set(self.sector_index_by_token.values())
+        index_names.add("Nifty 50")
+        api = getattr(self.broker, "smart_api", None)
+        if api is None or not hasattr(api, "getCandleData"):
+            log.warning("SECTOR HISTORY UNAVAILABLE | Angel One candle API is missing")
+            return
+
+        index_instruments = {}
+        for wrapper in self.scrip_master_data or []:
+            instrument = wrapper.get("raw_instrument", wrapper) if isinstance(wrapper, dict) else wrapper
+            if (
+                isinstance(instrument, dict)
+                and instrument.get("exch_seg") == "NSE"
+                and instrument.get("instrumenttype") == "AMXIDX"
+            ):
+                index_instruments[normalize_index_symbol(instrument.get("symbol"))] = instrument
+
+        changed = False
+        for index_name in sorted(index_names):
+            cached = self.sector_index_history.get(index_name) or {}
+            if cached.get("fetched_on") == today_text and cached.get("five_day_change_pct") is not None:
+                continue
+
+            instrument = index_instruments.get(normalize_index_symbol(index_name))
+            if not instrument:
+                continue
+
+            end = datetime.now(ZoneInfo("Asia/Kolkata"))
+            start = end - timedelta(days=18)
+            params = {
+                "exchange": "NSE",
+                "symboltoken": str(instrument.get("token", "")),
+                "interval": "ONE_DAY",
+                "fromdate": start.strftime("%Y-%m-%d %H:%M"),
+                "todate": end.strftime("%Y-%m-%d %H:%M"),
+            }
+            try:
+                response = api.getCandleData(params)
+                candle_rows = response.get("data", []) if isinstance(response, dict) and response.get("status") else []
+                completed = []
+                for row in candle_rows or []:
+                    if not isinstance(row, (list, tuple)) or len(row) < 5:
+                        continue
+                    candle_date = str(row[0])[:10]
+                    close = float(row[4] or 0)
+                    if candle_date < today_text and close > 0:
+                        completed.append((candle_date, close))
+                completed.sort(key=lambda entry: entry[0])
+                completed = completed[-6:]
+                five_day_change = None
+                if len(completed) == 6 and completed[0][1] > 0:
+                    five_day_change = (completed[-1][1] / completed[0][1] - 1.0) * 100.0
+                self.sector_index_history[index_name] = {
+                    "fetched_on": today_text,
+                    "dates": [entry[0] for entry in completed],
+                    "closes": [entry[1] for entry in completed],
+                    "five_day_change_pct": round(five_day_change, 3) if five_day_change is not None else None,
+                }
+                changed = True
+            except Exception as exc:
+                error_text = str(exc).lower()
+                if "rate" in error_text or "exceeding access" in error_text:
+                    log.warning(
+                        "SECTOR HISTORY RATE LIMITED | index=%s | "
+                        "stopping remaining candle requests for this refresh",
+                        index_name,
+                    )
+                    break
+                log.exception("SECTOR HISTORY FETCH FAILED | index=%s", index_name)
+            # Angel One's historical candle endpoint is rate limited. Keep
+            # index-history requests well spaced; this runs only once/session.
+            time.sleep(1.5)
+
+        if changed:
+            try:
+                self.sector_index_history_path.parent.mkdir(parents=True, exist_ok=True)
+                temporary_path = self.sector_index_history_path.with_suffix(".tmp")
+                with temporary_path.open("w", encoding="utf-8") as handle:
+                    json.dump(self.sector_index_history, handle, separators=(",", ":"))
+                temporary_path.replace(self.sector_index_history_path)
+            except Exception:
+                log.exception("Could not save sector-index history cache")
 
     def _record_intraday_volume_profile(self, symbol, session_date, minute_index, volume):
         """Keep one cumulative-volume observation per regular-session minute."""
@@ -2025,10 +2251,37 @@ class NSEHighPerformanceTradingPipeline:
         if change_15m > 0.1 and gain_pct < 0:
             recovery_score += 1.5
 
-        rating = int(round(min(100.0, max(0.0,
+        base_rating = int(round(min(100.0, max(0.0,
             trend_score + historical_settling_score + live_settling_score
             + volume_score + price_score + pressure_score + recovery_score
         ))))
+
+        company_sector = past_data.get("company_sector")
+        company_industry = past_data.get("company_industry")
+        sector_index = past_data.get("sector_index_symbol") or sector_index_for(
+            company_sector, company_industry
+        )
+        sector_live = self.sector_index_live_data.get(sector_index, {}) if sector_index else {}
+        sector_history = self.sector_index_history.get(sector_index, {}) if sector_index else {}
+        nifty_live = self.sector_index_live_data.get("Nifty 50", {})
+        nifty_history = self.sector_index_history.get("Nifty 50", {})
+        if time.time() - float(sector_live.get("updated_at", 0) or 0) > 120:
+            sector_live = {}
+        if time.time() - float(nifty_live.get("updated_at", 0) or 0) > 120:
+            nifty_live = {}
+        sector_day_change = sector_live.get("daily_change_pct")
+        sector_5d_change = sector_history.get("five_day_change_pct")
+        nifty_day_change = nifty_live.get("daily_change_pct")
+        nifty_5d_change = nifty_history.get("five_day_change_pct")
+        sector_adjustment, sector_vs_nifty_5d = sector_rating_adjustment(
+            sector_day_change,
+            sector_5d_change,
+            nifty_day_change,
+            nifty_5d_change,
+        )
+        # Sector context helps ranking, while statuses continue to use the
+        # stock's base score and existing price/volume/pressure requirements.
+        rating = int(round(min(100.0, max(0.0, base_rating + sector_adjustment))))
 
         price_up = change_15m > 0.1 or gain_pct > 0
         volume_confirmed = volume_ratio >= 1.0
@@ -2043,7 +2296,7 @@ class NSEHighPerformanceTradingPipeline:
             recommendation = "BREAK"
             status = "🔵 BREAK"
         elif (
-            rating >= 70
+            base_rating >= 70
             and price_up
             and volume_confirmed
             and pressure_supportive
@@ -2052,7 +2305,7 @@ class NSEHighPerformanceTradingPipeline:
         ):
             recommendation = "BUY"
             status = "🟢 BUY"
-        elif rating >= 40 or price_up or volume_ratio >= 1.2:
+        elif base_rating >= 40 or price_up or volume_ratio >= 1.2:
             recommendation = "WATCH"
             status = "🟡 WATCH"
         else:
@@ -2063,6 +2316,23 @@ class NSEHighPerformanceTradingPipeline:
             "symbol": symbol,
             "score": rating,
             "rating": rating,
+            "base_rating": base_rating,
+            "company_sector": company_sector,
+            "company_industry": company_industry,
+            "sector_index": sector_index,
+            "sector_index_daily_change_pct": (
+                round(float(sector_day_change), 2)
+                if sector_day_change is not None else None
+            ),
+            "sector_index_5d_change_pct": (
+                round(float(sector_5d_change), 2)
+                if sector_5d_change is not None else None
+            ),
+            "sector_vs_nifty_5d_pct": (
+                round(float(sector_vs_nifty_5d), 2)
+                if sector_vs_nifty_5d is not None else None
+            ),
+            "sector_rating_adjustment": sector_adjustment,
             "recommendation": recommendation,
             "status": status,
             "ltp": round(ltp, 2),

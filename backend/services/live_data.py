@@ -202,6 +202,14 @@ def build_snapshot(engine):
             "last_5_avg_daily_move": past.get("last_5_avg_daily_move"),
             "daily_macd": signal.get("daily_macd"),
             "daily_rsi": signal.get("daily_rsi"),
+            "company_sector": signal.get("company_sector"),
+            "company_industry": signal.get("company_industry"),
+            "sector_index": signal.get("sector_index"),
+            "sector_index_daily_change_pct": signal.get("sector_index_daily_change_pct"),
+            "sector_index_5d_change_pct": signal.get("sector_index_5d_change_pct"),
+            "sector_vs_nifty_5d_pct": signal.get("sector_vs_nifty_5d_pct"),
+            "sector_rating_adjustment": signal.get("sector_rating_adjustment", 0),
+            "base_rating": signal.get("base_rating", rating),
             "gain": gain_pct,
             "rvol": _num(signal.get("vol")),
             "buying_pressure": _num(cs.get("buying_pressure"), 0.5),
@@ -265,7 +273,7 @@ def build_snapshot(engine):
         stocks_by_symbol.values(),
         key=lambda x: x.get("rating", 0),
         reverse=True,
-    )[:100]
+    )[:300]
     return {
         "updated_at": time.time(),
         "stocks": stocks,
