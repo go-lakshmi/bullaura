@@ -19,6 +19,10 @@ def build_snapshot(engine):
     row is excluded so live LTP/current volume come only from Angel One.
     """
     stocks_by_symbol = {}
+    new_stocks_by_symbol = {}
+    new_listing_symbols = set(
+        getattr(engine, "new_listing_candidates", {}).keys()
+    )
     today = datetime.now(ZoneInfo("Asia/Kolkata")).date()
     chart_start_date = today - timedelta(days=30)
 
@@ -29,7 +33,12 @@ def build_snapshot(engine):
 
         cs = cache.get("ui_last_cs") or {}
         signal = cache.get("ui_unified_signal") or {}
-        past = getattr(engine, "volume_shockers", {}).get(symbol, {}) or {}
+        is_new_listing = symbol in new_listing_symbols
+        past = (
+            getattr(engine, "new_listing_candidates", {}).get(symbol, {})
+            if is_new_listing
+            else getattr(engine, "volume_shockers", {}).get(symbol, {})
+        ) or {}
 
         # ---------------------------------------------------------------
         # ONE-MONTH CHART DATA
@@ -167,11 +176,6 @@ def build_snapshot(engine):
         rating = _num(signal.get("rating", signal.get("score")))
         gain_pct = _num(cs.get("gain_pct"))
 
-        # Presentation-only rule: keep sharp intraday gainers off the UI.
-        # This runs before ranking so excluded cards do not consume a top-100 slot.
-        if gain_pct > 3.0:
-            continue
-
         live_ltp = _num(cs.get("ltp"))
         day_low = _num(cs.get("day_low"))
         distance_from_day_low_pct = (
@@ -182,10 +186,15 @@ def build_snapshot(engine):
 
         # Hide stocks trading less than 0.5% above today's low. This affects
         # only the UI snapshot; tick processing and rating continue normally.
-        if (
+        if not is_new_listing and (
             distance_from_day_low_pct is not None
             and distance_from_day_low_pct < 0.5
         ):
+            continue
+
+        # The two regular-card presentation hides do not apply to short-
+        # history candidates: show every evaluated short-history stock.
+        if not is_new_listing and gain_pct > 3.0:
             continue
 
         signal_age = max(0.0, time.time() - _num(cache.get("ui_updated_at"), time.time()))
@@ -197,6 +206,8 @@ def build_snapshot(engine):
 
         stock_payload = {
             "symbol": symbol,
+            "is_new_listing": is_new_listing,
+            "historical_sessions": past.get("historical_sessions"),
             "token": str(token),
             "ltp": current_ltp,
             "last_5_avg_daily_move": past.get("last_5_avg_daily_move"),
@@ -265,16 +276,23 @@ def build_snapshot(engine):
 
         # Defensive symbol-level deduplication. If Angel One exposes more than
         # one cache/token for a symbol, the strongest qualified row wins.
-        existing = stocks_by_symbol.get(symbol)
+        destination = new_stocks_by_symbol if is_new_listing else stocks_by_symbol
+        existing = destination.get(symbol)
         if existing is None or stock_payload["rating"] > existing["rating"]:
-            stocks_by_symbol[symbol] = stock_payload
+            destination[symbol] = stock_payload
 
     stocks = sorted(
         stocks_by_symbol.values(),
         key=lambda x: x.get("rating", 0),
         reverse=True,
     )[:300]
+    new_stocks = sorted(
+        new_stocks_by_symbol.values(),
+        key=lambda x: x.get("rating", 0),
+        reverse=True,
+    )
     return {
         "updated_at": time.time(),
         "stocks": stocks,
+        "new_stocks": new_stocks,
     }

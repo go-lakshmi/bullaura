@@ -20,8 +20,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_json(snapshot)
                 last_sent_at = snapshot_updated_at
                 log.debug(
-                    "LOCAL UI WebSocket sent batch updated_at=%s stocks=%d client=%s",
-                    snapshot_updated_at, len(snapshot.get("stocks", [])), client
+                    "LOCAL UI WebSocket sent batch updated_at=%s stocks=%d new_stocks=%d client=%s",
+                    snapshot_updated_at,
+                    len(snapshot.get("stocks", [])),
+                    len(snapshot.get("new_stocks", [])),
+                    client,
                 )
 
             await asyncio.sleep(0.5)

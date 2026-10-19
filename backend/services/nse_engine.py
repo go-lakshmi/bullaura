@@ -126,6 +126,7 @@ class NSEHighPerformanceTradingPipeline:
         self.settings = {}
         self.scrip_master_data = None
         self.volume_shockers = {}
+        self.new_listing_candidates = {}
         self.sector_index_by_token = {}
         self.sector_index_live_data = {}
         self.sector_index_history_path = Path("data/sector_index_history.json")
@@ -172,8 +173,8 @@ class NSEHighPerformanceTradingPipeline:
         cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
 
-        # v10 adds Yahoo sector/industry fields to the daily candidate cache.
-        cache_version = "nse_live_volume_shocker_v10"
+        # v11 adds separately streamed short-history candidates.
+        cache_version = "nse_live_volume_shocker_v11"
 
         # ------------------------------------------------------------------
         # CACHE
@@ -189,6 +190,7 @@ class NSEHighPerformanceTradingPipeline:
                     and cached_data.get("version") == cache_version
                 ):
                     self.volume_shockers = cached_data.get("data", {})
+                    self.new_listing_candidates = cached_data.get("new_listings", {})
 
                     log.info(
                         "NSE CACHE LOADED | date=%s | version=%s | stocks=%d",
@@ -249,9 +251,11 @@ class NSEHighPerformanceTradingPipeline:
             "recent_cooling_failed": 0,
             "api_or_processing_error": 0,
             "passed": 0,
+            "short_history_candidates": 0,
         }
 
         counter_lock = threading.Lock()
+        new_listing_results = {}
 
         def increment_counter(name):
             with counter_lock:
@@ -343,25 +347,6 @@ class NSEHighPerformanceTradingPipeline:
                     ].copy()
 
                 # ----------------------------------------------------------
-                # NEED 22 NSE SESSIONS
-                # ----------------------------------------------------------
-
-                if len(df) < 22:
-
-                    increment_counter(
-                        "less_than_22_rows"
-                    )
-
-                    log.warning(
-                        "NSE REJECT | %s | "
-                        "reason=LESS_THAN_22_SESSIONS | rows=%d",
-                        symbol,
-                        len(df),
-                    )
-
-                    return symbol, None
-
-                # ----------------------------------------------------------
                 # REQUIRED COLUMNS
                 # ----------------------------------------------------------
 
@@ -450,7 +435,7 @@ class NSEHighPerformanceTradingPipeline:
                     ]
                 ).copy()
 
-                if len(df) < 22:
+                if df.empty:
 
                     increment_counter(
                         "invalid_price_rows"
@@ -463,6 +448,81 @@ class NSEHighPerformanceTradingPipeline:
                         len(df),
                     )
 
+                    return symbol, None
+
+                # Keep valid histories with fewer than 22 completed EQ
+                # sessions in a separate live-only collection. They bypass
+                # the established-stock filters below, including liquidity,
+                # 52-week position, historical pattern, cooling, and Yahoo
+                # fundamentals. No-history or malformed rows are still rejected.
+                if len(df) < 22:
+                    increment_counter("less_than_22_rows")
+                    short_history = df.copy()
+                    valid_short_prices = (
+                        (short_history["PrevClose"] > 0)
+                        & (short_history["HighPrice"] > 0)
+                        & (short_history["LowPrice"] > 0)
+                        & (short_history["ClosePrice"] > 0)
+                        & (short_history["HighPrice"] >= short_history["LowPrice"])
+                    )
+                    short_history = short_history.loc[valid_short_prices].copy()
+                    if short_history.empty:
+                        increment_counter("invalid_price_rows")
+                        return symbol, None
+
+                    short_ranges = (
+                        (short_history["HighPrice"] - short_history["LowPrice"])
+                        / short_history["LowPrice"].replace(0, np.nan)
+                        * 100.0
+                    ).dropna()
+                    short_daily_moves = (
+                        (short_history["ClosePrice"] - short_history["PrevClose"])
+                        / short_history["PrevClose"].replace(0, np.nan)
+                        * 100.0
+                    ).dropna()
+                    short_history["DailyMovePct"] = short_daily_moves.reindex(
+                        short_history.index
+                    ).round(4)
+                    short_records = short_history.to_dict(orient="records")
+                    for record in short_records:
+                        for key, value in list(record.items()):
+                            if isinstance(value, pd.Timestamp):
+                                record[key] = value.strftime("%Y-%m-%d")
+                            elif isinstance(value, (float, np.floating)) and not np.isfinite(value):
+                                record[key] = None
+                            elif isinstance(value, (np.integer,)):
+                                record[key] = int(value)
+                            elif isinstance(value, (np.floating,)):
+                                record[key] = float(value)
+
+                    with counter_lock:
+                        new_listing_results[symbol] = {
+                            "symbol": symbol,
+                            "is_new_listing": True,
+                            "historical_sessions": len(short_history),
+                            "avg_trades_20d": round(
+                                float(short_history["No.ofTrades"].dropna().mean()), 2
+                            ) if short_history["No.ofTrades"].notna().any() else 0.0,
+                            "avg_volume_20d": round(
+                                float(short_history["TotalTradedQuantity"].dropna().mean()), 2
+                            ) if "TotalTradedQuantity" in short_history and short_history["TotalTradedQuantity"].notna().any() else 0.0,
+                            "avg_volume_5d": round(
+                                float(short_history["TotalTradedQuantity"].head(5).dropna().mean()), 2
+                            ) if "TotalTradedQuantity" in short_history and short_history["TotalTradedQuantity"].head(5).notna().any() else 0.0,
+                            "avg_range_20d_pct": round(float(short_ranges.mean()), 4) if not short_ranges.empty else 0.0,
+                            "avg_range_5d_pct": round(float(short_ranges.head(5).mean()), 4) if not short_ranges.empty else 0.0,
+                            "last_5_avg_daily_move": round(float(short_daily_moves.head(5).mean()), 4) if not short_daily_moves.empty else 0.0,
+                            "higher_low_structure": False,
+                            "nse_data": short_records,
+                            "indicator_closes_oldest_first": [],
+                            "indicator_history_last_date": short_history.iloc[0]["Date"].strftime("%Y-%m-%d"),
+                        }
+                    increment_counter("short_history_candidates")
+                    log.info(
+                        "NSE SHORT HISTORY QUEUED | %s | sessions=%d | Angel One + New Stocks UI",
+                        symbol,
+                        len(short_history),
+                    )
                     return symbol, None
 
                 # Require a minimum average daily trade count so very
@@ -1175,6 +1235,7 @@ class NSEHighPerformanceTradingPipeline:
         # ============================================================== 
 
         self.volume_shockers = results
+        self.new_listing_candidates = new_listing_results
 
         # ==============================================================
         # FINAL FILTER SUMMARY
@@ -1201,6 +1262,10 @@ class NSEHighPerformanceTradingPipeline:
         log.info(
             "Less than 22 sessions        : %d",
             filter_counts["less_than_22_rows"],
+        )
+        log.info(
+            "Short-history candidates     : %d",
+            filter_counts["short_history_candidates"],
         )
 
         log.info(
@@ -1284,6 +1349,7 @@ class NSEHighPerformanceTradingPipeline:
                         "date": today_str,
                         "version": cache_version,
                         "data": self.volume_shockers,
+                        "new_listings": self.new_listing_candidates,
                     },
                     f,
                     indent=2,
@@ -1459,21 +1525,26 @@ class NSEHighPerformanceTradingPipeline:
         """Subscribe to selected NSE stocks and only their needed index feeds."""
         target_tokens = []
         self.tick_unmapped_symbols = []
-        
-        # 1) Extract clean stock symbols from self.volume_shockers data (stripping suffix like '.NS')
-        volume_shocker_symbols = {
+
+        # Stream regular and short-history candidates through the same socket.
+        all_candidates = dict(self.volume_shockers)
+        all_candidates.update(self.new_listing_candidates)
+        candidate_symbols = {
             sym.replace(".NS", "").strip() for sym in self.volume_shockers.keys()
         }
-        
-        if not volume_shocker_symbols:
-            log.warning("No symbols found in self.volume_shockers to subscribe.")
+        candidate_symbols.update(
+            sym.replace(".NS", "").strip() for sym in self.new_listing_candidates.keys()
+        )
+
+        if not candidate_symbols:
+            log.warning("No regular or short-history NSE candidates found to subscribe.")
             return
 
         for item in self.scrip_master_data:
             inst = item.get("raw_instrument", item) if isinstance(item, dict) else item
             if isinstance(inst, dict) and inst.get("exch_seg") == "NSE":
                 symbol_root = inst.get("symbol", "").split("-")[0].strip()
-                if symbol_root in volume_shocker_symbols:
+                if symbol_root in candidate_symbols:
                     token = str(inst.get("token")).strip()
                     if token not in target_tokens:
                         target_tokens.append(token)
@@ -1524,7 +1595,7 @@ class NSEHighPerformanceTradingPipeline:
             for token in target_tokens
             if token in self.live_cache
         }
-        self.tick_unmapped_symbols = sorted(volume_shocker_symbols - mapped_symbols)
+        self.tick_unmapped_symbols = sorted(candidate_symbols - mapped_symbols)
         if self.tick_unmapped_symbols:
             log.warning(
                 "NSE candidates without Angel One NSE tokens | count=%d | symbols=%s",
@@ -1533,8 +1604,8 @@ class NSEHighPerformanceTradingPipeline:
             )
 
         required_index_names = {"Nifty 50"}
-        for symbol in volume_shocker_symbols:
-            stock = self.volume_shockers.get(symbol, {}) or {}
+        for symbol in candidate_symbols:
+            stock = all_candidates.get(symbol, {}) or {}
             sector_name = stock.get("sector_index_symbol") or sector_index_for(
                 stock.get("company_sector"), stock.get("company_industry")
             )
@@ -1675,7 +1746,10 @@ class NSEHighPerformanceTradingPipeline:
                             self._record_tick_status("skipped", token, "invalid_ltp")
                             continue
 
-                        past_data = self.volume_shockers.get(symbol)
+                        past_data = (
+                            self.volume_shockers.get(symbol)
+                            or self.new_listing_candidates.get(symbol)
+                        )
                         if not past_data:
                             self._record_tick_status("skipped", token, "no_historical_data")
                             continue

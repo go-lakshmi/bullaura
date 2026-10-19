@@ -8,6 +8,7 @@ const API = "http://127.0.0.1:8000";
 export default function App() {
   const [data, setData] = useState({
     stocks: [],
+    new_stocks: [],
     updated_at: null,
   });
 
@@ -93,6 +94,50 @@ export default function App() {
     [data.stocks, q]
   );
 
+  const newStocks = useMemo(
+    () =>
+      (data.new_stocks || [])
+        .filter(
+          (s) =>
+            !q ||
+            String(s.symbol || "").toLowerCase().includes(q.toLowerCase())
+        )
+        .map((stock, index) => ({ stock, index }))
+        .sort((a, b) => {
+          const priorityStatus = (stock) =>
+            [stock.status, stock.category, stock.recommendation].some((candidate) => {
+              const value = String(candidate || "")
+                .toUpperCase()
+                .replace(/^[^A-Z]*/, "")
+                .trim();
+              return value === "BUY" || value === "BREAK";
+            });
+          const aPriority = priorityStatus(a.stock);
+          const bPriority = priorityStatus(b.stock);
+          if (aPriority !== bPriority) return aPriority ? -1 : 1;
+          const gainDifference =
+            Number(b.stock.gain ?? 0) - Number(a.stock.gain ?? 0);
+          if (gainDifference !== 0) return gainDifference;
+          const sectorAdjustmentDifference =
+            Number(b.stock.sector_rating_adjustment ?? 0) -
+            Number(a.stock.sector_rating_adjustment ?? 0);
+          if (sectorAdjustmentDifference !== 0) return sectorAdjustmentDifference;
+          const aSectorFiveDay = Number(a.stock.sector_index_5d_change_pct);
+          const bSectorFiveDay = Number(b.stock.sector_index_5d_change_pct);
+          const aHasSectorFiveDay = Number.isFinite(aSectorFiveDay);
+          const bHasSectorFiveDay = Number.isFinite(bSectorFiveDay);
+          if (aHasSectorFiveDay !== bHasSectorFiveDay) {
+            return aHasSectorFiveDay ? -1 : 1;
+          }
+          if (aHasSectorFiveDay && bSectorFiveDay !== aSectorFiveDay) {
+            return bSectorFiveDay - aSectorFiveDay;
+          }
+          return a.index - b.index;
+        })
+        .map(({ stock }) => stock),
+    [data.new_stocks, q]
+  );
+
   return (
     <div className="app">
       <header>
@@ -117,14 +162,22 @@ export default function App() {
         <button onClick={() => setMode("cards2")} className={mode === "cards2" ? "active" : ""}>
           Cards 2 (101–300)
         </button>
+        <button onClick={() => setMode("new-stocks")} className={mode === "new-stocks" ? "active" : ""}>
+          New Stocks ({newStocks.length})
+        </button>
         <button onClick={() => setMode("table")} className={mode === "table" ? "active" : ""}>
           Table
         </button>
       </div>
 
-      {mode === "cards" || mode === "cards2" ? (
+      {mode === "cards" || mode === "cards2" || mode === "new-stocks" ? (
         <main className="grid">
-          {(mode === "cards" ? stocks.slice(0, 100) : stocks.slice(100, 300)).map((s) => <StockCard key={s.symbol} stock={s} />)}
+          {(mode === "new-stocks"
+            ? newStocks
+            : mode === "cards"
+              ? stocks.slice(0, 100)
+              : stocks.slice(100, 300)
+          ).map((s) => <StockCard key={s.symbol} stock={s} />)}
           {!stocks.length && mode === "cards" && (
             <div className="empty">
               The UI is ready. Start the configured Python engine to populate live stocks.
@@ -132,6 +185,9 @@ export default function App() {
           )}
           {mode === "cards2" && stocks.length <= 100 && (
             <div className="empty">No stocks ranked 101–300 are available right now.</div>
+          )}
+          {mode === "new-stocks" && newStocks.length === 0 && (
+            <div className="empty">No short-history stocks have live data right now.</div>
           )}
         </main>
       ) : (

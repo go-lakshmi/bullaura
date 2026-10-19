@@ -9,7 +9,7 @@ class AppState:
     def __init__(self):
         self.engine = None
         self.lock = Lock()
-        self.latest = {"updated_at": None, "stocks": []}
+        self.latest = {"updated_at": None, "stocks": [], "new_stocks": []}
         self._last_published_at = 0.0
         self._publish_interval = 60.0
         self._publish_count = 0
@@ -67,7 +67,10 @@ class AppState:
         }
 
     def _collect_ui_stocks_locked(self, snapshot):
-        for stock in snapshot.get("stocks", []) or []:
+        for stock in (
+            list(snapshot.get("stocks", []) or [])
+            + list(snapshot.get("new_stocks", []) or [])
+        ):
             symbol = str(stock.get("symbol", "") or "").strip().replace(".NS", "")
             if not symbol:
                 continue
