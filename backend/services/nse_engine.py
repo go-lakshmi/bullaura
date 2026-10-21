@@ -127,6 +127,7 @@ class NSEHighPerformanceTradingPipeline:
         self.scrip_master_data = None
         self.volume_shockers = {}
         self.new_listing_candidates = {}
+        self.ma_recovery_candidates = {}
         self.sector_index_by_token = {}
         self.sector_index_live_data = {}
         self.sector_index_history_path = Path("data/sector_index_history.json")
@@ -173,8 +174,8 @@ class NSEHighPerformanceTradingPipeline:
         cache_file = Path("data/volume_shockers_cache.json")
         today_str = time.strftime("%Y-%m-%d")
 
-        # v11 adds separately streamed short-history candidates.
-        cache_version = "nse_live_volume_shocker_v11"
+        # v13 retains SMA-only rejects for live recovery monitoring.
+        cache_version = "nse_live_volume_shocker_v14"
 
         # ------------------------------------------------------------------
         # CACHE
@@ -191,12 +192,18 @@ class NSEHighPerformanceTradingPipeline:
                 ):
                     self.volume_shockers = cached_data.get("data", {})
                     self.new_listing_candidates = cached_data.get("new_listings", {})
+                    self.ma_recovery_candidates = cached_data.get("ma_recovery", {})
 
                     log.info(
                         "NSE CACHE LOADED | date=%s | version=%s | stocks=%d",
                         today_str,
                         cache_version,
                         len(self.volume_shockers),
+                    )
+                    log.info(
+                        "NSE CACHE RECOVERY LOADED | ma_recovery=%d | new_listings=%d",
+                        len(self.ma_recovery_candidates),
+                        len(self.new_listing_candidates),
                     )
 
                     return
@@ -247,6 +254,9 @@ class NSEHighPerformanceTradingPipeline:
             "low_average_trades": 0,
             "invalid_52week_range": 0,
             "low_52week_position": 0,
+            "moving_average_failed": 0,
+            "moving_average_insufficient_history": 0,
+            "moving_average_recovery_candidates": 0,
             "historical_pattern_failed": 0,
             "recent_cooling_failed": 0,
             "api_or_processing_error": 0,
@@ -573,10 +583,10 @@ class NSEHighPerformanceTradingPipeline:
                     / week_52_range
                     * 100.0
                 )
-                if position_52w_pct < 50.0:
+                if position_52w_pct < 20.0:
                     increment_counter("low_52week_position")
                     log.info(
-                        "NSE REJECT | %s | reason=52_WEEK_POSITION_BELOW_50%% | "
+                        "NSE REJECT | %s | reason=52_WEEK_POSITION_BELOW_20%% | "
                         "position=%.2f%% | close=%.2f | low=%.2f | high=%.2f",
                         symbol,
                         position_52w_pct,
@@ -585,6 +595,67 @@ class NSEHighPerformanceTradingPipeline:
                         week_52_high,
                     )
                     return symbol, None
+
+                ma_recovery_candidate = False
+
+                # Calculate each simple moving average for which this stock
+                # has enough completed sessions. These values are also used
+                # by the UI-only live-LTP gate, including for stocks with
+                # fewer than 200 sessions.
+                sma_periods = (20, 50, 100, 200)
+                moving_averages = {
+                    period: float(df["ClosePrice"].head(period).mean())
+                    for period in sma_periods
+                    if len(df) >= period
+                }
+
+                # Preserve the historical recovery rule: only classify a
+                # stock as below all averages when all four averages exist.
+                if len(df) < max(sma_periods):
+                    increment_counter("moving_average_insufficient_history")
+                    log.info(
+                        "NSE MA GATE SKIPPED | %s | reason=INSUFFICIENT_SESSIONS | "
+                        "sessions=%d | required=%d | available=%s",
+                        symbol,
+                        len(df),
+                        max(sma_periods),
+                        list(moving_averages),
+                    )
+                else:
+                    below_all_moving_averages = all(
+                        latest_completed_close < average
+                        for average in moving_averages.values()
+                    )
+                    if below_all_moving_averages:
+                        ma_recovery_candidate = True
+                        increment_counter("moving_average_failed")
+                        log.info(
+                            "NSE MA RECOVERY QUEUED | %s | reason=CLOSE_BELOW_ALL_SMA | "
+                            "close=%.2f | SMA20=%.2f | SMA50=%.2f | "
+                            "SMA100=%.2f | SMA200=%.2f",
+                            symbol,
+                            latest_completed_close,
+                            moving_averages[20],
+                            moving_averages[50],
+                            moving_averages[100],
+                            moving_averages[200],
+                        )
+                    else:
+                        log.info(
+                            "NSE MA GATE PASS | %s | close=%.2f | "
+                            "SMA20=%.2f | SMA50=%.2f | SMA100=%.2f | "
+                            "SMA200=%.2f | above=%s",
+                            symbol,
+                            latest_completed_close,
+                            moving_averages[20],
+                            moving_averages[50],
+                            moving_averages[100],
+                            moving_averages[200],
+                            [
+                                period for period, average in moving_averages.items()
+                                if latest_completed_close >= average
+                            ],
+                        )
 
                 # Preserve a longer close history for daily MACD/RSI while
                 # keeping the existing 22-session filter payload unchanged.
@@ -986,10 +1057,13 @@ class NSEHighPerformanceTradingPipeline:
                 # PASSED
                 # ==========================================================
 
-                increment_counter("passed")
+                if ma_recovery_candidate:
+                    increment_counter("moving_average_recovery_candidates")
+                else:
+                    increment_counter("passed")
 
                 log.info(
-                    "NSE SELECTED | %s | "
+                    "%s | %s | "
                     "pattern=%s | "
                     "avg_trades_20d=%.2f | "
                     "last_5_avg_move=%.4f%% | "
@@ -997,6 +1071,9 @@ class NSEHighPerformanceTradingPipeline:
                     "fall_m4=%.2f%% | fall_m3=%.2f%% | "
                     "avg_range_20d=%.2f%% | cooling_threshold=%.2f%% | "
                     "recent_ranges=%s | 52w_position=%.2f%%",
+                    "NSE RECOVERY DATA READY"
+                    if ma_recovery_candidate
+                    else "NSE SELECTED",
                     symbol,
                     selected_pattern,
                     avg_trades_20d,
@@ -1024,6 +1101,11 @@ class NSEHighPerformanceTradingPipeline:
                     "52_week_high": round(week_52_high, 2),
                     "52_week_low": round(week_52_low, 2),
                     "position_52w_pct": round(position_52w_pct, 2),
+                    "is_ma_recovery_candidate": ma_recovery_candidate,
+                    "moving_averages": {
+                        f"sma{period}": round(average, 4)
+                        for period, average in moving_averages.items()
+                    },
 
                     "avg_volume_20d": round(
                         avg_volume_20d,
@@ -1224,6 +1306,24 @@ class NSEHighPerformanceTradingPipeline:
 
         results, fundamentals_counts = add_debt_to_equity_and_filter(results)
 
+        self.ma_recovery_candidates = {
+            symbol: stock
+            for symbol, stock in results.items()
+            if stock.get("is_ma_recovery_candidate")
+        }
+        self.volume_shockers = {
+            symbol: stock
+            for symbol, stock in results.items()
+            if not stock.get("is_ma_recovery_candidate")
+        }
+        results = self.volume_shockers
+        log.info(
+            "NSE LIVE UNIVERSE READY | regular=%d | ma_recovery=%d | new_listings=%d",
+            len(self.volume_shockers),
+            len(self.ma_recovery_candidates),
+            len(new_listing_results),
+        )
+
         log.info(
             "FUNDAMENTALS FILTER COMPLETE | passed=%d | rejected=%d | unknown_kept=%d",
             fundamentals_counts["passed"],
@@ -1234,7 +1334,6 @@ class NSEHighPerformanceTradingPipeline:
         # STORE RESULTS
         # ============================================================== 
 
-        self.volume_shockers = results
         self.new_listing_candidates = new_listing_results
 
         # ==============================================================
@@ -1294,8 +1393,23 @@ class NSEHighPerformanceTradingPipeline:
         )
 
         log.info(
-            "52-week position < 50%%       : %d",
+            "52-week position < 20%%       : %d",
             filter_counts["low_52week_position"],
+        )
+
+        log.info(
+            "Below SMA20/50/100/200         : %d",
+            filter_counts["moving_average_failed"],
+        )
+
+        log.info(
+            "SMA recovery candidates       : %d",
+            filter_counts["moving_average_recovery_candidates"],
+        )
+
+        log.info(
+            "MA gate insufficient history  : %d",
+            filter_counts["moving_average_insufficient_history"],
         )
 
         log.info(
@@ -1323,8 +1437,9 @@ class NSEHighPerformanceTradingPipeline:
         )
 
         print(
-            f"\nNSE filters passed: "
-            f"{len(results)} / {len(symbols)} stocks."
+            f"\nNSE regular candidates: {len(results)}; "
+            f"SMA recovery candidates: {len(self.ma_recovery_candidates)}; "
+            f"new listings: {len(self.new_listing_candidates)}."
         )
 
         # ==============================================================
@@ -1350,6 +1465,7 @@ class NSEHighPerformanceTradingPipeline:
                         "version": cache_version,
                         "data": self.volume_shockers,
                         "new_listings": self.new_listing_candidates,
+                        "ma_recovery": self.ma_recovery_candidates,
                     },
                     f,
                     indent=2,
@@ -1358,10 +1474,11 @@ class NSEHighPerformanceTradingPipeline:
 
             log.info(
                 "NSE CACHE SAVED | "
-                "date=%s | version=%s | stocks=%d | file=%s",
+                "date=%s | version=%s | stocks=%d | ma_recovery=%d | file=%s",
                 today_str,
                 cache_version,
                 len(self.volume_shockers),
+                len(self.ma_recovery_candidates),
                 cache_file,
             )
 
@@ -1529,15 +1646,29 @@ class NSEHighPerformanceTradingPipeline:
         # Stream regular and short-history candidates through the same socket.
         all_candidates = dict(self.volume_shockers)
         all_candidates.update(self.new_listing_candidates)
+        all_candidates.update(self.ma_recovery_candidates)
+        regular_symbols = {
+            sym.replace(".NS", "").strip()
+            for sym in self.volume_shockers.keys()
+        }
+        regular_symbols.update(
+            sym.replace(".NS", "").strip()
+            for sym in self.new_listing_candidates.keys()
+        )
+        recovery_symbols = {
+            sym.replace(".NS", "").strip()
+            for sym in self.ma_recovery_candidates.keys()
+        }
         candidate_symbols = {
             sym.replace(".NS", "").strip() for sym in self.volume_shockers.keys()
         }
         candidate_symbols.update(
             sym.replace(".NS", "").strip() for sym in self.new_listing_candidates.keys()
         )
+        candidate_symbols.update(recovery_symbols)
 
         if not candidate_symbols:
-            log.warning("No regular or short-history NSE candidates found to subscribe.")
+            log.warning("No regular, recovery, or short-history NSE candidates found to subscribe.")
             return
 
         for item in self.scrip_master_data:
@@ -1668,8 +1799,62 @@ class NSEHighPerformanceTradingPipeline:
                 daemon=True,
             ).start()
 
-        stock_tokens = [token for token in target_tokens if token not in self.sector_index_by_token]
+        all_stock_tokens = [
+            token for token in target_tokens
+            if token not in self.sector_index_by_token
+        ]
         index_tokens = [token for token in target_tokens if token in self.sector_index_by_token]
+
+        # Angel One allows up to 1,000 token subscriptions per WebSocket
+        # session. Keep regular/new-listing candidates and index feeds first;
+        # use the remaining session capacity for SMA recovery candidates.
+        max_session_tokens = 1000
+        if len(target_tokens) > max_session_tokens:
+            base_stock_tokens = [
+                token for token in all_stock_tokens
+                if self.live_cache.get(token, {}).get("symbol") in regular_symbols
+            ]
+            recovery_stock_tokens = [
+                token for token in all_stock_tokens
+                if self.live_cache.get(token, {}).get("symbol") in recovery_symbols
+            ]
+            allowed_index_tokens = index_tokens[:max_session_tokens]
+            index_tokens = allowed_index_tokens
+            stock_capacity = max(0, max_session_tokens - len(allowed_index_tokens))
+            allowed_base_tokens = base_stock_tokens[:stock_capacity]
+            recovery_capacity = max(0, stock_capacity - len(allowed_base_tokens))
+            allowed_recovery_tokens = recovery_stock_tokens[:recovery_capacity]
+            stock_tokens = allowed_base_tokens + allowed_recovery_tokens
+            target_tokens = stock_tokens + allowed_index_tokens
+            mapped_symbols = {
+                self.live_cache[token].get("symbol", "")
+                for token in stock_tokens
+                if token in self.live_cache
+            }
+            omitted_recovery_count = max(
+                0, len(recovery_stock_tokens) - len(allowed_recovery_tokens)
+            )
+            omitted_base_count = max(
+                0, len(base_stock_tokens) - len(allowed_base_tokens)
+            )
+            if omitted_base_count:
+                log.error(
+                    "Angel One subscription capacity is below the regular candidate count | "
+                    "omitted_regular_or_new=%d | session_limit=%d",
+                    omitted_base_count,
+                    max_session_tokens,
+                )
+            if omitted_recovery_count:
+                log.warning(
+                    "SMA recovery subscriptions capped | omitted=%d | "
+                    "session_limit=%d | existing_stock_tokens=%d | index_tokens=%d",
+                    omitted_recovery_count,
+                    max_session_tokens,
+                    len(allowed_base_tokens),
+                    len(allowed_index_tokens),
+                )
+        else:
+            stock_tokens = all_stock_tokens
 
         # 2) Stocks use FULL mode for their depth metrics; index feeds only
         # need quote mode for LTP and previous-close comparisons.
@@ -1692,8 +1877,13 @@ class NSEHighPerformanceTradingPipeline:
                     if token in self.tick_stats_by_token:
                         self.tick_stats_by_token[token]["subscription_requested"] = True
             log.info(
-                "Angel One subscriptions requested | stocks=%d | sector_indexes=%d | total_tokens=%d",
+                "Angel One subscriptions requested | stocks=%d | "
+                "ma_recovery=%d | sector_indexes=%d | total_tokens=%d",
                 len(mapped_symbols),
+                sum(
+                    1 for token in stock_tokens
+                    if self.live_cache.get(token, {}).get("symbol") in recovery_symbols
+                ),
                 len(found_indexes),
                 len(target_tokens),
             )
@@ -1749,12 +1939,17 @@ class NSEHighPerformanceTradingPipeline:
                         past_data = (
                             self.volume_shockers.get(symbol)
                             or self.new_listing_candidates.get(symbol)
+                            or self.ma_recovery_candidates.get(symbol)
                         )
                         if not past_data:
                             self._record_tick_status("skipped", token, "no_historical_data")
                             continue
 
                         signal = self.evaluate_unified_candidate(symbol, past_data, cs)
+                        if symbol in self.ma_recovery_candidates:
+                            self._update_ma_recovery_confirmation(
+                                cache, past_data, cs, symbol
+                            )
                         self._update_ui_state(
                             symbol, token, cs, signal, past_data
                         )
@@ -1848,7 +2043,10 @@ class NSEHighPerformanceTradingPipeline:
         return {
             "aggregate": aggregate,
             "queue_depth": self.tick_queue.qsize(),
-            "historical_candidate_count": len(self.volume_shockers),
+            "historical_candidate_count": (
+                len(self.volume_shockers) + len(self.ma_recovery_candidates)
+            ),
+            "ma_recovery_candidate_count": len(self.ma_recovery_candidates),
             "subscription_requested_token_count": len(subscribed_tokens),
             "subscription_requested_symbol_count": len(subscribed_symbols),
             "sector_index_subscription_requested_count": len(subscribed_index_tokens),
@@ -1879,6 +2077,65 @@ class NSEHighPerformanceTradingPipeline:
             "past_data": past_data,
             "updated_at": cache["ui_updated_at"],
         }
+
+    @staticmethod
+    def _update_ma_recovery_confirmation(cache, past_data, cs, symbol):
+        """Promote an SMA-rejected candidate after a sustained live recovery."""
+        ltp = float(cs.get("ltp") or 0.0)
+        previous_close = float(cs.get("last_closed_price") or 0.0)
+        moving_averages = past_data.get("moving_averages") or {}
+        above_averages = [
+            period
+            for period in (20, 50, 100, 200)
+            if float(moving_averages.get(f"sma{period}") or 0.0) > 0
+            and ltp > float(moving_averages[f"sma{period}"])
+        ]
+        qualifies_now = (
+            ltp > 0
+            and previous_close > 0
+            and ltp > previous_close
+            and bool(above_averages)
+        )
+        now = time.time()
+        was_confirmed = bool(cache.get("ma_recovery_confirmed"))
+
+        if not qualifies_now:
+            cache.pop("ma_recovery_since", None)
+            cache.pop("ma_recovery_last_qualifying_at", None)
+            cache["ma_recovery_confirmed"] = False
+            cache["ma_recovery_above_smas"] = []
+            if was_confirmed:
+                log.info(
+                    "SMA RECOVERY REMOVED | %s | ltp=%.2f | previous_close=%.2f | "
+                    "above_smas=%s",
+                    symbol,
+                    ltp,
+                    previous_close,
+                    above_averages,
+                )
+            return
+
+        last_qualifying_at = cache.get("ma_recovery_last_qualifying_at")
+        since = cache.get("ma_recovery_since")
+        if since is None or last_qualifying_at is None or now - last_qualifying_at > 60.0:
+            since = now
+            cache["ma_recovery_since"] = since
+
+        cache["ma_recovery_last_qualifying_at"] = now
+        cache["ma_recovery_above_smas"] = above_averages
+        confirmed = now - since >= 180.0
+        cache["ma_recovery_confirmed"] = confirmed
+
+        if confirmed and not was_confirmed:
+            log.info(
+                "SMA RECOVERY CONFIRMED | %s | ltp=%.2f | previous_close=%.2f | "
+                "above_smas=%s | held_seconds=%.0f",
+                symbol,
+                ltp,
+                previous_close,
+                above_averages,
+                now - since,
+            )
 
     def _market_elapsed_fraction(self):
         """
@@ -2438,6 +2695,75 @@ class NSEHighPerformanceTradingPipeline:
     def evaluate_btst_candidate(self, symbol, past_data, cs):
         """Compatibility alias to the unified stock rating evaluator."""
         return self.evaluate_unified_candidate(symbol, past_data, cs)
+    @staticmethod
+    def _update_intraday_15m_candle(cache, ltp, current_volume):
+        """Aggregate processed Angel One ticks into the current 15-minute bar."""
+        now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        session_date = now.strftime("%Y-%m-%d")
+        minute_of_day = now.hour * 60 + now.minute
+        market_open = 9 * 60 + 15
+        market_close = 15 * 60 + 30
+        if ltp <= 0 or minute_of_day < market_open or minute_of_day >= market_close:
+            return
+
+        if cache.get("intraday_candle_date") != session_date:
+            cache["intraday_candle_date"] = session_date
+            cache["intraday_15m_candles"] = []
+            cache["intraday_candle_previous_volume"] = None
+
+        bucket_start = market_open + ((minute_of_day - market_open) // 15) * 15
+        bucket_end = bucket_start + 15
+        candles = cache.setdefault("intraday_15m_candles", [])
+        previous_cumulative = cache.get("intraday_candle_previous_volume")
+        try:
+            previous_cumulative = (
+                int(previous_cumulative) if previous_cumulative is not None else None
+            )
+        except (TypeError, ValueError):
+            previous_cumulative = None
+
+        try:
+            current_volume = max(0, int(current_volume or 0))
+        except (TypeError, ValueError):
+            current_volume = 0
+
+        candle = candles[-1] if candles else None
+        if not candle or candle.get("start_minute") != bucket_start:
+            volume_baseline = (
+                previous_cumulative
+                if previous_cumulative is not None and current_volume >= previous_cumulative
+                else current_volume
+            )
+            candle = {
+                "date": session_date,
+                "start_minute": bucket_start,
+                "end_minute": bucket_end,
+                "start": f"{bucket_start // 60:02d}:{bucket_start % 60:02d}",
+                "end": f"{bucket_end // 60:02d}:{bucket_end % 60:02d}",
+                "open": float(ltp),
+                "high": float(ltp),
+                "low": float(ltp),
+                "close": float(ltp),
+                "volume": max(0, current_volume - volume_baseline),
+                "volume_baseline": volume_baseline,
+            }
+            candles.append(candle)
+            if len(candles) > 26:
+                del candles[:-26]
+        else:
+            volume_baseline = int(candle.get("volume_baseline", current_volume) or 0)
+            if previous_cumulative is not None and current_volume < previous_cumulative:
+                # Handle a broker volume counter reset without creating a
+                # negative bar or reassigning the whole session's volume.
+                volume_baseline = current_volume
+                candle["volume_baseline"] = volume_baseline
+            candle["high"] = max(float(candle.get("high", ltp)), float(ltp))
+            candle["low"] = min(float(candle.get("low", ltp)), float(ltp))
+            candle["close"] = float(ltp)
+            candle["volume"] = max(0, current_volume - volume_baseline)
+
+        cache["intraday_candle_previous_volume"] = current_volume
+
     def analyze_tick_metrics(self, token: str, msg: dict) -> dict:
         """
         Parse an Angel One FULL-mode tick and calculate live metrics.
@@ -2765,6 +3091,8 @@ class NSEHighPerformanceTradingPipeline:
                 "ltp": ltp,
                 "volume": current_volume,
             })
+
+        self._update_intraday_15m_candle(cache, ltp, current_volume)
 
         # Update state AFTER calculating comparisons.
         cache["prev_ltp"] = ltp

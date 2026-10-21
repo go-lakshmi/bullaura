@@ -2,8 +2,39 @@ import React from "react";
 import { useEffect, useMemo, useState } from "react";
 import StockCard from "./components/StockCard";
 import StockTable from "./components/StockTable";
+import {
+  getBreakoutRetestSignal,
+  getEngulfingSignal,
+  getLongLowerWickSignal,
+  getMorningStarSignal,
+} from "./utils/candleSignals";
 
 const API = "http://127.0.0.1:8000";
+
+function getStockSortTier(stock) {
+  if (getBreakoutRetestSignal(stock)) return -4;
+  if (getEngulfingSignal(stock)) return -3;
+  if (getMorningStarSignal(stock)) return -2;
+  if (getLongLowerWickSignal(stock)) return -1;
+
+  const isBuyOrBreak = [stock.status, stock.category, stock.recommendation].some(
+    (candidate) => {
+      const value = String(candidate || "")
+        .toUpperCase()
+        .replace(/^[^A-Z]*/, "")
+        .trim();
+      return value === "BUY" || value === "BREAK";
+    }
+  );
+  if (isBuyOrBreak) return 0;
+
+  const setup = String(stock.today_support_resistance?.setup_label || "")
+    .toUpperCase()
+    .trim();
+  if (setup === "BOUNCE CONFIRMED") return 1;
+  if (setup === "SUPPORT TEST") return 2;
+  return 3;
+}
 
 export default function App() {
   const [data, setData] = useState({
@@ -49,25 +80,10 @@ export default function App() {
         )
         .map((stock, index) => ({ stock, index }))
         .sort((a, b) => {
-          const priorityStatus = (stock) => {
-            return [stock.status, stock.category, stock.recommendation].some(
-              (candidate) => {
-                const value = String(candidate || "")
-                  .toUpperCase()
-                  .replace(/^[^A-Z]*/, "")
-                  .trim();
-                return value === "BUY" || value === "BREAK";
-              }
-            );
-          };
+          const tierDifference = getStockSortTier(a.stock) - getStockSortTier(b.stock);
+          if (tierDifference !== 0) return tierDifference;
 
-          const aPriority = priorityStatus(a.stock);
-          const bPriority = priorityStatus(b.stock);
-          if (aPriority !== bPriority) return aPriority ? -1 : 1;
-
-          // Promote BUY/BREAK first, then sort by stock gain.
-          if (aPriority !== bPriority) return aPriority ? -1 : 1;
-
+          // Within each priority tier, keep the existing gain/sector ordering.
           const gainDifference =
             Number(b.stock.gain ?? 0) - Number(a.stock.gain ?? 0);
           if (gainDifference !== 0) return gainDifference;
@@ -104,17 +120,8 @@ export default function App() {
         )
         .map((stock, index) => ({ stock, index }))
         .sort((a, b) => {
-          const priorityStatus = (stock) =>
-            [stock.status, stock.category, stock.recommendation].some((candidate) => {
-              const value = String(candidate || "")
-                .toUpperCase()
-                .replace(/^[^A-Z]*/, "")
-                .trim();
-              return value === "BUY" || value === "BREAK";
-            });
-          const aPriority = priorityStatus(a.stock);
-          const bPriority = priorityStatus(b.stock);
-          if (aPriority !== bPriority) return aPriority ? -1 : 1;
+          const tierDifference = getStockSortTier(a.stock) - getStockSortTier(b.stock);
+          if (tierDifference !== 0) return tierDifference;
           const gainDifference =
             Number(b.stock.gain ?? 0) - Number(a.stock.gain ?? 0);
           if (gainDifference !== 0) return gainDifference;

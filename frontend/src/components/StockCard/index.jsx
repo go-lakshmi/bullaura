@@ -3,6 +3,12 @@ import PriceChart from "../PriceChart";
 import VolumeChart from "../VolumeChart";
 import Metrics from "../Metrics";
 import TodayPopup from "../TodayPopup";
+import {
+  getBreakoutRetestSignal,
+  getEngulfingSignal,
+  getLongLowerWickSignal,
+  getMorningStarSignal,
+} from "../../utils/candleSignals";
 
 function getStatus(category) {
   const value = String(category || "").toUpperCase().trim();
@@ -39,14 +45,41 @@ export default function StockCard({ stock }) {
     && Number.isFinite(Number(dailyRsi))
     && Number(dailyRsi) > 40
   );
+  const lowerWickSignal = getLongLowerWickSignal(stock);
+  const morningStarSignal = getMorningStarSignal(stock);
+  const engulfingSignal = getEngulfingSignal(stock);
+  const breakoutRetestSignal = getBreakoutRetestSignal(stock);
   const status = getStatus(stock.category);
+  const setupLabel = String(stock.today_support_resistance?.setup_label || "")
+    .toUpperCase()
+    .trim();
+  const setupCode = breakoutRetestSignal
+    ? "BRT"
+    : setupLabel === "SUPPORT TEST"
+      ? "ST"
+      : setupLabel === "BOUNCE CONFIRMED"
+        ? "BC"
+        : "";
   const [showToday, setShowToday] = useState(false);
   const [showPriceDetails, setShowPriceDetails] = useState(false);
 
   return (
     <article className="card">
       <div className="cardTop">
-        <div><strong>{stock.symbol}</strong></div>
+        <div>
+          <strong>{stock.symbol}</strong>
+          {stock.is_ma_recovery && (
+            <span
+              className="recoveryBadge"
+              title={
+                "Live recovery confirmed above: " +
+                (stock.recovery_above_smas || [])
+                  .map((period) => `SMA${period}`)
+                  .join(", ")
+              }
+            >RECOVERY</span>
+          )}
+        </div>
         <div>
           <b>
             ₹{Number(stock.ltp || 0).toFixed(2)}
@@ -80,10 +113,10 @@ export default function StockCard({ stock }) {
         className={`common-status ${status.className}`}
         onMouseEnter={() => setShowToday(true)}
         onMouseLeave={() => setShowToday(false)}
-        aria-label={`${status.label}. Hover for today's intraday price and volume.`}
+        aria-label={`${status.label}${setupCode ? ` - ${setupCode === "BRT" ? "BREAKOUT RETEST" : setupLabel}` : ""}. Hover for today's 15-minute candles, volume, support and resistance.`}
       >
         <span>{status.icon}</span>
-        <span>{status.label}</span>
+        <span>{status.label}{setupCode ? ` - ${setupCode}` : ""}</span>
         {showToday && <TodayPopup stock={stock} />}
       </div>
 
@@ -109,7 +142,37 @@ export default function StockCard({ stock }) {
       )}
 
       <div className="priceChartHeading">
-        <label>PRICE</label>
+        <div className="priceChartTitle">
+          <label>PRICE</label>
+          {breakoutRetestSignal && (
+            <span
+              className="priceSignalBadge priceSignalBadge-green"
+              title={`Breakout retest confirmed: closed above ₹${breakoutRetestSignal.level.toFixed(2)} on ${breakoutRetestSignal.breakoutVolumeRatio.toFixed(2)}× volume, retested and held, then turned up`}
+              aria-label="Breakout retest confirmed on completed 15-minute candles"
+            >BRT</span>
+          )}
+          {engulfingSignal && (
+            <span
+              className={`priceSignalBadge priceSignalBadge-${engulfingSignal.color}`}
+              title={`Bullish engulfing pattern on the latest two completed 15-minute candles; current body is ${engulfingSignal.bodyToPrevious.toFixed(2)}× the previous body`}
+              aria-label="Bullish engulfing pattern on completed 15-minute candles"
+            >NG</span>
+          )}
+          {morningStarSignal && (
+            <span
+              className="priceSignalBadge priceSignalBadge-green"
+              title={`Morning Star on the latest three completed 15-minute candles: first red body ${morningStarSignal.firstBodyToPriorAverage.toFixed(2)}× the previous five-candle average; third green body ${morningStarSignal.thirdBodyToFirstBody.toFixed(2)}× the first body and closed above its midpoint`}
+              aria-label="Morning Star pattern on completed 15-minute candles"
+            >MS</span>
+          )}
+          {lowerWickSignal && (
+            <span
+              className={`priceSignalBadge priceSignalBadge-${lowerWickSignal.color}`}
+              title={`Latest completed 15-minute candle: lower wick ${lowerWickSignal.lowerWickToBody.toFixed(2)}× body; upper wick ${lowerWickSignal.upperWickToBody.toFixed(2)}× body`}
+              aria-label={`Long lower-wick candle, ${lowerWickSignal.color}`}
+            >CW</span>
+          )}
+        </div>
         <div className="priceChartLegend" aria-label="Price graph lines">
           <span><i className="legendAverage5"/>5D</span>
           <span><i className="legendAverage10"/>10D</span>
