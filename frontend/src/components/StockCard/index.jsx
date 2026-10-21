@@ -6,7 +6,7 @@ import TodayPopup from "../TodayPopup";
 import {
   getBreakoutRetestSignal,
   getEngulfingSignal,
-  getLongLowerWickSignal,
+  getHammerSignal,
   getMorningStarSignal,
 } from "../../utils/candleSignals";
 
@@ -45,7 +45,7 @@ export default function StockCard({ stock }) {
     && Number.isFinite(Number(dailyRsi))
     && Number(dailyRsi) > 40
   );
-  const lowerWickSignal = getLongLowerWickSignal(stock);
+  const hammerSignal = getHammerSignal(stock);
   const morningStarSignal = getMorningStarSignal(stock);
   const engulfingSignal = getEngulfingSignal(stock);
   const breakoutRetestSignal = getBreakoutRetestSignal(stock);
@@ -165,12 +165,12 @@ export default function StockCard({ stock }) {
               aria-label="Morning Star pattern on completed 15-minute candles"
             >MS</span>
           )}
-          {lowerWickSignal && (
+          {hammerSignal && (
             <span
-              className={`priceSignalBadge priceSignalBadge-${lowerWickSignal.color}`}
-              title={`Latest completed 15-minute candle: lower wick ${lowerWickSignal.lowerWickToBody.toFixed(2)}× body; upper wick ${lowerWickSignal.upperWickToBody.toFixed(2)}× body`}
-              aria-label={`Long lower-wick candle, ${lowerWickSignal.color}`}
-            >CW</span>
+              className={`priceSignalBadge priceSignalBadge-${hammerSignal.color}`}
+              title={`Hammer-shaped latest completed 15-minute candle after a ${hammerSignal.priorDeclinePct.toFixed(2)}% decline across the previous four candles; lower wick ${hammerSignal.lowerWickToBody.toFixed(2)}× body; upper wick ${hammerSignal.upperWickToBody.toFixed(2)}× body`}
+              aria-label={`Hammer pattern after a short-term decline, ${hammerSignal.color} candle`}
+            >HM</span>
           )}
         </div>
         <div className="priceChartLegend" aria-label="Price graph lines">

@@ -5,7 +5,7 @@ import StockTable from "./components/StockTable";
 import {
   getBreakoutRetestSignal,
   getEngulfingSignal,
-  getLongLowerWickSignal,
+  getHammerSignal,
   getMorningStarSignal,
 } from "./utils/candleSignals";
 
@@ -15,7 +15,7 @@ function getStockSortTier(stock) {
   if (getBreakoutRetestSignal(stock)) return -4;
   if (getEngulfingSignal(stock)) return -3;
   if (getMorningStarSignal(stock)) return -2;
-  if (getLongLowerWickSignal(stock)) return -1;
+  if (getHammerSignal(stock)) return -1;
 
   const isBuyOrBreak = [stock.status, stock.category, stock.recommendation].some(
     (candidate) => {
