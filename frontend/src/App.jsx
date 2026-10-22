@@ -4,18 +4,26 @@ import StockCard from "./components/StockCard";
 import StockTable from "./components/StockTable";
 import {
   getBreakoutRetestSignal,
+  getDojiSignal,
   getEngulfingSignal,
   getHammerSignal,
   getMorningStarSignal,
+  getVolumeSurgeSignal,
 } from "./utils/candleSignals";
 
 const API = "http://127.0.0.1:8000";
 
 function getStockSortTier(stock) {
+  if (getDojiSignal(stock)) return -6;
+  if (getVolumeSurgeSignal(stock)) return -5;
   if (getBreakoutRetestSignal(stock)) return -4;
-  if (getEngulfingSignal(stock)) return -3;
-  if (getMorningStarSignal(stock)) return -2;
-  if (getHammerSignal(stock)) return -1;
+  const patternSignals = [
+    getEngulfingSignal(stock),
+    getMorningStarSignal(stock),
+    getHammerSignal(stock),
+  ].filter(Boolean);
+  if (patternSignals.some((signal) => signal.supported)) return -3;
+  if (patternSignals.length) return -2;
 
   const isBuyOrBreak = [stock.status, stock.category, stock.recommendation].some(
     (candidate) => {
@@ -34,6 +42,15 @@ function getStockSortTier(stock) {
   if (setup === "BOUNCE CONFIRMED") return 1;
   if (setup === "SUPPORT TEST") return 2;
   return 3;
+}
+
+function getPatternContextRank(stock) {
+  return Math.max(
+    0,
+    getEngulfingSignal(stock)?.contextRank || 0,
+    getMorningStarSignal(stock)?.contextRank || 0,
+    getHammerSignal(stock)?.contextRank || 0,
+  );
 }
 
 export default function App() {
@@ -82,6 +99,9 @@ export default function App() {
         .sort((a, b) => {
           const tierDifference = getStockSortTier(a.stock) - getStockSortTier(b.stock);
           if (tierDifference !== 0) return tierDifference;
+
+          const contextDifference = getPatternContextRank(b.stock) - getPatternContextRank(a.stock);
+          if (contextDifference !== 0) return contextDifference;
 
           // Within each priority tier, keep the existing gain/sector ordering.
           const gainDifference =

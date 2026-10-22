@@ -5,9 +5,11 @@ import Metrics from "../Metrics";
 import TodayPopup from "../TodayPopup";
 import {
   getBreakoutRetestSignal,
+  getDojiSignal,
   getEngulfingSignal,
   getHammerSignal,
   getMorningStarSignal,
+  getVolumeSurgeSignal,
 } from "../../utils/candleSignals";
 
 function getStatus(category) {
@@ -19,6 +21,21 @@ function getStatus(category) {
   if (value === "WAIT") return { label: "WAIT", icon: "🔴", className: "status-wait" };
 
   return { label: value || "WAIT", icon: value ? "⚪" : "🔴", className: "status-default" };
+}
+
+function getPatternContextTitle(name, signal) {
+  const parts = [`${name} on completed 15-minute candles`];
+  if (signal.supported) {
+    parts.push(
+      `near multi-week support ₹${Number(signal.context.supportLevel).toFixed(2)} (${signal.context.supportTouches} historical swing-low touches) with upward candle confirmation`
+    );
+  } else {
+    parts.push("without both multi-week support and upward confirmation");
+  }
+  if (signal.context.pullbackVolumeDryUp) {
+    parts.push("preceded by a multi-day pullback on declining volume");
+  }
+  return parts.join("; ");
 }
 
 export default function StockCard({ stock }) {
@@ -49,6 +66,8 @@ export default function StockCard({ stock }) {
   const morningStarSignal = getMorningStarSignal(stock);
   const engulfingSignal = getEngulfingSignal(stock);
   const breakoutRetestSignal = getBreakoutRetestSignal(stock);
+  const dojiSignal = getDojiSignal(stock);
+  const volumeSurgeSignal = getVolumeSurgeSignal(stock);
   const status = getStatus(stock.category);
   const setupLabel = String(stock.today_support_resistance?.setup_label || "")
     .toUpperCase()
@@ -144,6 +163,20 @@ export default function StockCard({ stock }) {
       <div className="priceChartHeading">
         <div className="priceChartTitle">
           <label>PRICE</label>
+          {dojiSignal && (
+            <span
+              className="priceSignalBadge priceSignalBadge-green"
+              title={`A completed Doji formed at/just below support ₹${dojiSignal.support.toFixed(2)} (body ${ (dojiSignal.bodyToRange * 100).toFixed(1)}% of candle range); the following 15-minute candle has turned green${dojiSignal.confirmationCompleted ? " and closed green" : " and is still forming"}`}
+              aria-label="Doji near support followed by a green 15-minute candle"
+            >DJ</span>
+          )}
+          {volumeSurgeSignal && (
+            <span
+              className="priceSignalBadge priceSignalBadge-green"
+              title={`Live 15-minute candle volume is ${volumeSurgeSignal.volumeRatio.toFixed(2)}× the previous completed candle; candle is green and price has risen over the last 60 seconds`}
+              aria-label={`Live volume surge, ${volumeSurgeSignal.volumeRatio.toFixed(2)} times previous candle, green candle with rising price`}
+            >VOL</span>
+          )}
           {breakoutRetestSignal && (
             <span
               className="priceSignalBadge priceSignalBadge-green"
@@ -154,23 +187,23 @@ export default function StockCard({ stock }) {
           {engulfingSignal && (
             <span
               className={`priceSignalBadge priceSignalBadge-${engulfingSignal.color}`}
-              title={`Bullish engulfing pattern on the latest two completed 15-minute candles; current body is ${engulfingSignal.bodyToPrevious.toFixed(2)}× the previous body`}
+              title={`${getPatternContextTitle("Bullish engulfing pattern", engulfingSignal)}; current body is ${engulfingSignal.bodyToPrevious.toFixed(2)}× the previous body`}
               aria-label="Bullish engulfing pattern on completed 15-minute candles"
-            >NG</span>
+            >NG{engulfingSignal.supported ? "+" : ""}</span>
           )}
           {morningStarSignal && (
             <span
               className="priceSignalBadge priceSignalBadge-green"
-              title={`Morning Star on the latest three completed 15-minute candles: first red body ${morningStarSignal.firstBodyToPriorAverage.toFixed(2)}× the previous five-candle average; third green body ${morningStarSignal.thirdBodyToFirstBody.toFixed(2)}× the first body and closed above its midpoint`}
+              title={`${getPatternContextTitle("Morning Star", morningStarSignal)}; first red body ${morningStarSignal.firstBodyToPriorAverage.toFixed(2)}× the previous five-candle average; third green body ${morningStarSignal.thirdBodyToFirstBody.toFixed(2)}× the first body and closed above its midpoint`}
               aria-label="Morning Star pattern on completed 15-minute candles"
-            >MS</span>
+            >MS{morningStarSignal.supported ? "+" : ""}</span>
           )}
           {hammerSignal && (
             <span
               className={`priceSignalBadge priceSignalBadge-${hammerSignal.color}`}
-              title={`Hammer-shaped latest completed 15-minute candle after a ${hammerSignal.priorDeclinePct.toFixed(2)}% decline across the previous four candles; lower wick ${hammerSignal.lowerWickToBody.toFixed(2)}× body; upper wick ${hammerSignal.upperWickToBody.toFixed(2)}× body`}
+              title={`${getPatternContextTitle("Hammer", hammerSignal)}; after a ${hammerSignal.priorDeclinePct.toFixed(2)}% decline across the previous four candles; lower wick ${hammerSignal.lowerWickToBody.toFixed(2)}× body; upper wick ${hammerSignal.upperWickToBody.toFixed(2)}× body`}
               aria-label={`Hammer pattern after a short-term decline, ${hammerSignal.color} candle`}
-            >HM</span>
+            >HM{hammerSignal.supported ? "+" : ""}</span>
           )}
         </div>
         <div className="priceChartLegend" aria-label="Price graph lines">
