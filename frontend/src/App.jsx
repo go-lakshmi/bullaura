@@ -15,15 +15,11 @@ const API = "http://127.0.0.1:8000";
 
 function getStockSortTier(stock) {
   if (getDojiSignal(stock)) return -6;
-  if (getVolumeSurgeSignal(stock)) return -5;
-  if (getBreakoutRetestSignal(stock)) return -4;
-  const patternSignals = [
-    getEngulfingSignal(stock),
-    getMorningStarSignal(stock),
-    getHammerSignal(stock),
-  ].filter(Boolean);
-  if (patternSignals.some((signal) => signal.supported)) return -3;
-  if (patternSignals.length) return -2;
+  if (getHammerSignal(stock)) return -5;
+  if (getVolumeSurgeSignal(stock)) return -4;
+  if (getEngulfingSignal(stock)) return -3;
+  if (getBreakoutRetestSignal(stock)) return -2;
+  if (getMorningStarSignal(stock)) return -1;
 
   const isBuyOrBreak = [stock.status, stock.category, stock.recommendation].some(
     (candidate) => {
